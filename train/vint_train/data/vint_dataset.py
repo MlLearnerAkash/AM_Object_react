@@ -18,6 +18,12 @@ from vint_train.data.data_utils import (
     to_local_coords,
 )
 
+# VLN-CE discrete action labels
+VLN_STOP = 0
+VLN_FORWARD = 1
+VLN_LEFT = 2
+VLN_RIGHT = 3
+
 
 class ViNT_Dataset(Dataset):
     def __init__(
@@ -114,6 +120,10 @@ class ViNT_Dataset(Dataset):
         self.normalize = normalize
         self.obs_type = obs_type
         self.goal_type = goal_type
+        # VLN-CE discrete action mode
+        self.discrete_actions = self.kwargs.get("discrete_actions", False)
+        self.vln_fwd_threshold = self.kwargs.get("vln_fwd_threshold", 0.05)   # metres
+        self.vln_turn_threshold = self.kwargs.get("vln_turn_threshold", 0.2)   # radians
 
         # load data/data_config.yaml
         with open(
@@ -338,6 +348,64 @@ class ViNT_Dataset(Dataset):
 
         return actions, goal_pos
 
+    def _compute_discrete_actions(self, traj_data, curr_time, goal_time):
+        """
+        Convert trajectory waypoints into VLN-CE style discrete action labels.
+
+        Each of the len_traj_pred future steps is mapped to one of:
+            STOP    (0) – negligible displacement
+            FORWARD (1) – forward movement without significant turn
+            LEFT    (2) – positive yaw change (turn left)
+            RIGHT   (3) – negative yaw change (turn right)
+
+        Returns:
+            disc_actions (np.ndarray): shape (len_traj_pred,), dtype int64
+            goal_pos (np.ndarray): 2-D goal position in local frame (for vis)
+        """
+        start_index = curr_time
+        end_index = curr_time + self.len_traj_pred * self.waypoint_spacing + 1
+        yaw = traj_data["yaw"][start_index:end_index:self.waypoint_spacing]
+        positions = traj_data["position"][start_index:end_index:self.waypoint_spacing]
+        goal_pos = traj_data["position"][
+            min(goal_time, len(traj_data["position"]) - 1)
+        ]
+
+        if len(yaw.shape) == 2:
+            yaw = yaw.squeeze(1)
+
+        if yaw.shape != (self.len_traj_pred + 1,):
+            const_len = self.len_traj_pred + 1 - yaw.shape[0]
+            yaw = np.concatenate([yaw, np.repeat(yaw[-1], const_len)])
+            positions = np.concatenate(
+                [positions, np.repeat(positions[-1][None], const_len, axis=0)], axis=0
+            )
+
+        # Convert to local coordinate frame (same as _compute_actions)
+        waypoints = to_local_coords(positions, positions[0], yaw[0])
+        goal_pos = to_local_coords(goal_pos, positions[0], yaw[0])
+        yaw_deltas = yaw[1:] - yaw[0]  # cumulative yaw change from current frame
+
+        disc_actions = np.zeros(self.len_traj_pred, dtype=np.int64)
+        for t in range(self.len_traj_pred):
+            dx, dy = waypoints[t + 1]
+            displacement = np.sqrt(dx ** 2 + dy ** 2)
+            turn = yaw_deltas[t]
+            if displacement < self.vln_fwd_threshold:
+                disc_actions[t] = VLN_STOP
+            elif turn > self.vln_turn_threshold:
+                disc_actions[t] = VLN_LEFT
+            elif turn < -self.vln_turn_threshold:
+                disc_actions[t] = VLN_RIGHT
+            else:
+                disc_actions[t] = VLN_FORWARD
+
+        if self.normalize:
+            goal_pos /= (
+                self.data_config["metric_waypoint_spacing"] * self.waypoint_spacing
+            )
+
+        return disc_actions, goal_pos
+
     def _get_trajectory(self, trajectory_name):
         if trajectory_name in self.trajectory_cache:
             return self.trajectory_cache[trajectory_name]
@@ -440,7 +508,16 @@ class ViNT_Dataset(Dataset):
         assert goal_time < goal_traj_len, f"{goal_time} an {goal_traj_len}"
 
         # Compute actions
-        actions, goal_pos = self._compute_actions(curr_traj_data, curr_time, goal_time)
+        if self.discrete_actions:
+            actions, goal_pos = self._compute_discrete_actions(
+                curr_traj_data, curr_time, goal_time
+            )
+            actions_torch = torch.as_tensor(actions, dtype=torch.int64)
+        else:
+            actions, goal_pos = self._compute_actions(curr_traj_data, curr_time, goal_time)
+            actions_torch = torch.as_tensor(actions, dtype=torch.float32)
+            if self.learn_angle:
+                actions_torch = calculate_sin_cos(actions_torch)
 
         # Compute distances
         if goal_is_negative:
@@ -450,10 +527,6 @@ class ViNT_Dataset(Dataset):
             assert (
                 goal_time - curr_time
             ) % self.waypoint_spacing == 0, f"{goal_time} and {curr_time} should be separated by an integer multiple of {self.waypoint_spacing}"
-
-        actions_torch = torch.as_tensor(actions, dtype=torch.float32)
-        if self.learn_angle:
-            actions_torch = calculate_sin_cos(actions_torch)
 
         action_mask = (
             (distance < self.max_action_distance)

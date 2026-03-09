@@ -6,6 +6,8 @@ from prettytable import PrettyTable
 
 from vint_train.training.train_utils import train, evaluate
 from vint_train.training.train_utils import train_nomad, evaluate_nomad
+from vint_train.training.train_utils import train_vln, evaluate_vln
+
 
 import torch
 import torch.nn as nn
@@ -324,3 +326,118 @@ def count_parameters(model):
     # print(table)
     print(f"Total Trainable Params: {total_params/1e6:.2f}M")
     return total_params
+
+
+# ============================================================================
+# VLN-CE discrete action training loop
+# ============================================================================
+
+def train_eval_loop_vln(
+    train_model: bool,
+    model: nn.Module,
+    optimizer: Adam,
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
+    dataloader: DataLoader,
+    test_dataloaders: Dict[str, DataLoader],
+    transform,
+    epochs: int,
+    device: torch.device,
+    project_folder: str,
+    normalized: bool,
+    wandb_log_freq: int = 10,
+    print_log_freq: int = 100,
+    image_log_freq: int = 1000,
+    num_images_log: int = 8,
+    current_epoch: int = 0,
+    alpha: float = 0.5,
+    use_wandb: bool = True,
+    eval_fraction: float = 0.25,
+    **kwargs,
+):
+    """
+    Train and evaluate the model for several epochs using VLN-CE discrete
+    action labels (STOP=0, FORWARD=1, LEFT=2, RIGHT=3).
+
+    Identical to ``train_eval_loop`` in structure but delegates to
+    ``train_vln`` / ``evaluate_vln`` which use cross-entropy loss and log
+    classification accuracy instead of cosine similarity.
+    """
+    assert 0 <= alpha <= 1
+    latest_path = os.path.join(project_folder, "latest.pth")
+
+    for epoch in range(current_epoch, epochs):
+        if train_model:
+            print(f"Start VLN Training Epoch {epoch}/{epochs}")
+            train_vln(
+                model=model,
+                optimizer=optimizer,
+                dataloader=dataloader,
+                transform=transform,
+                device=device,
+                project_folder=project_folder,
+                normalized=normalized,
+                epoch=epoch,
+                alpha=alpha,
+                print_log_freq=print_log_freq,
+                wandb_log_freq=wandb_log_freq,
+                image_log_freq=image_log_freq,
+                num_images_log=num_images_log,
+                use_wandb=use_wandb,
+                **kwargs,
+            )
+
+        avg_total_test_loss = []
+        for dataset_type in test_dataloaders:
+            print(f"Start {dataset_type} VLN Testing Epoch {epoch}/{epochs}")
+            loader = test_dataloaders[dataset_type]
+
+            test_dist_loss, test_action_loss, total_eval_loss = evaluate_vln(
+                eval_type=dataset_type,
+                model=model,
+                dataloader=loader,
+                transform=transform,
+                device=device,
+                project_folder=project_folder,
+                normalized=normalized,
+                epoch=epoch,
+                alpha=alpha,
+                num_images_log=num_images_log,
+                use_wandb=use_wandb,
+                eval_fraction=eval_fraction,
+                **kwargs,
+            )
+            avg_total_test_loss.append(total_eval_loss)
+
+        checkpoint = {
+            "epoch": epoch,
+            "model": model,
+            "optimizer": optimizer,
+            "avg_total_test_loss": np.mean(avg_total_test_loss),
+            "scheduler": scheduler,
+            "wandb_run_id": wandb.run.id if use_wandb else None,
+            "wandb_run_dir": wandb.run.dir if use_wandb else None,
+        }
+        wandb.log({}, commit=False)
+
+        if scheduler is not None:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(np.mean(avg_total_test_loss))
+            else:
+                scheduler.step()
+        wandb.log(
+            {
+                "avg_total_test_loss": np.mean(avg_total_test_loss),
+                "lr": optimizer.param_groups[0]["lr"],
+            },
+            commit=False,
+        )
+
+        try:
+            numbered_path = os.path.join(project_folder, f"{epoch}.pth")
+            torch.save(checkpoint, latest_path)
+            torch.save(checkpoint, numbered_path)
+        except Exception as e:
+            print("Error saving model", e)
+
+    wandb.log({})
+    print()

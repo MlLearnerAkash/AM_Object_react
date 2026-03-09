@@ -35,6 +35,7 @@ from vint_train.data.vint_dataset import ViNT_Dataset
 from vint_train.training.train_eval_loop import (
     train_eval_loop,
     train_eval_loop_nomad,
+    train_eval_loop_vln,
     load_model,
 )
 
@@ -309,6 +310,10 @@ def main(config):
         "obs_type": config.get("obs_type", "image"),
         "dims": config.get("dims", None),
         "goal_uses_context": config.get("goal_uses_context", False),
+        # VLN-CE discrete action settings
+        "discrete_actions": config.get("discrete_actions", False),
+        "vln_fwd_threshold": config.get("vln_fwd_threshold", 0.05),
+        "vln_turn_threshold": config.get("vln_turn_threshold", 0.2),
     }
 
     assert config["distance"]["min_dist_cat"] < config["distance"]["max_dist_cat"]
@@ -388,7 +393,29 @@ def main(config):
         )
         return
 
-    if config["model_type"] == "vint" or config["model_type"] == "gnm":
+    if kwargs.get("discrete_actions", False):
+        train_eval_loop_vln(
+            train_model=config["mode"] == "train",
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            dataloader=train_loader,
+            test_dataloaders=test_dataloaders,
+            transform=transform,
+            epochs=config["epochs"],
+            device=device,
+            project_folder=config["project_folder"],
+            normalized=config["normalize"],
+            print_log_freq=config["print_log_freq"],
+            image_log_freq=config["image_log_freq"],
+            num_images_log=config["num_images_log"],
+            current_epoch=current_epoch,
+            alpha=config["alpha"],
+            use_wandb=config["use_wandb"],
+            eval_fraction=config["eval_fraction"],
+            **kwargs,
+        )
+    elif config["model_type"] == "vint" or config["model_type"] == "gnm":
         train_eval_loop(
             train_model=config["mode"] == "train",
             model=model,

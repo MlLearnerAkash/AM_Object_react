@@ -53,16 +53,16 @@ learn_angle: True
 # dataset specific parameters
 image_size: [85, 64] # width, height
 
-precomputed_filename: ./vint_train/data/data_splits/training/bigger_bot_0.3-sh_0.4/bigger_bot_0.3-sh_0.4_gt_topometric_e3d_masks_pls.h5
+precomputed_filename: ../training/bigger_bot_0.3-sh_0.4/bigger_bot_0.3-sh_0.4_gt_topometric_e3d_masks_pls.h5
 pl_perturb_ratio: 0.3 # \in [0, 1.0], where 0 disables it
 pl_perturb_type: max_val # from ["max_val", "rand_from_inliers"]
 mask_crop_ratio: 1.0 # \in [0, 1.0], where 1.0 disables it
 
 datasets:
   bigger_bot_0.3-sh_0.4:
-    data_folder: ./vint_train/data/data_splits/training/bigger_bot_0.3-sh_0.4/trajectories/
-    train: ./vint_train/data/data_splits/training/bigger_bot_0.3-sh_0.4/train/
-    test: ./vint_train/data/data_splits/training/bigger_bot_0.3-sh_0.4/test/
+    data_folder: ../training/bigger_bot_0.3-sh_0.4/trajectories/
+    train: ../training/bigger_bot_0.3-sh_0.4/train/
+    test: ../training/bigger_bot_0.3-sh_0.4/test/
     end_slack: 10
     goals_per_obs: 2 # increase dataset size
     negative_mining: True

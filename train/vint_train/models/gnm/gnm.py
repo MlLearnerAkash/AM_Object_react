@@ -87,9 +87,16 @@ class GNM(BaseModel):
             self.dist_predictor = nn.Sequential(
                 nn.Linear(32, 1),
             )
-        self.action_predictor = nn.Sequential(
-            nn.Linear(32, self.len_trajectory_pred * self.num_action_params),
-        )
+        # Discrete VLN-CE action predictor (STOP=0, FORWARD=1, LEFT=2, RIGHT=3)
+        # overrides the continuous action predictor when discrete_actions=True
+        if self.kwargs.get("discrete_actions", False):
+            self.discrete_action_predictor = nn.Sequential(
+                nn.Linear(32, self.len_trajectory_pred * 4),
+            )
+        else:
+            self.action_predictor = nn.Sequential(
+                nn.Linear(32, self.len_trajectory_pred * self.num_action_params),
+            )
 
     def forward(
         self, obs_img: torch.tensor, goal_img: torch.tensor
@@ -133,6 +140,15 @@ class GNM(BaseModel):
             dist_pred = self.dist_predictor(z)
         else:
             dist_pred = None
+        # --- Discrete VLN-CE actions (STOP / FORWARD / LEFT / RIGHT) --------
+        if self.kwargs.get("discrete_actions", False):
+            disc_logits = self.discrete_action_predictor(z)
+            # shape: (B, len_traj_pred, 4) — raw logits, no post-processing
+            action_pred = disc_logits.reshape(
+                (disc_logits.shape[0], self.len_trajectory_pred, 4)
+            )
+            return dist_pred, action_pred
+        # --- Continuous waypoint prediction (original behaviour) -------------
         action_pred = self.action_predictor(z)
 
         # augment outputs to match labels size-wise

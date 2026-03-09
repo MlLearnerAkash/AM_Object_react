@@ -1351,3 +1351,259 @@ def visualize_diffusion_action_distribution(
         plt.close(fig)
     if len(wandb_list) > 0 and use_wandb:
         wandb.log({f"{eval_type}_action_samples": wandb_list}, commit=False)
+
+
+# ============================================================================
+# VLN-CE discrete action utilities
+# Action mapping: STOP=0, FORWARD=1, LEFT=2, RIGHT=3
+# ============================================================================
+
+VLN_ACTIONS = {0: "STOP", 1: "FORWARD", 2: "LEFT", 3: "RIGHT"}
+VLN_NUM_ACTIONS = 4
+
+
+def _compute_losses_vln(
+    dist_label: torch.Tensor,
+    action_label: torch.Tensor,
+    dist_pred: torch.Tensor,
+    action_logits: torch.Tensor,
+    alpha: float,
+    action_mask: torch.Tensor,
+):
+    """
+    Compute losses for VLN-CE discrete action prediction.
+
+    Args:
+        dist_label:    (B,)       distance labels
+        action_label:  (B, T)     int64 discrete action class per timestep
+        dist_pred:     (B, 1)     predicted distance
+        action_logits: (B, T, 4)  raw logits for 4 VLN-CE actions
+        alpha:         weight for distance loss
+        action_mask:   (B,)       1 for valid samples
+    """
+    if dist_label is None or dist_pred is None:
+        dist_loss = torch.tensor(0.0, device=action_logits.device)
+    else:
+        dist_loss = F.mse_loss(dist_pred.squeeze(-1), dist_label.float())
+
+    B, T, C = action_logits.shape
+    logits_flat = action_logits.reshape(B * T, C)          # (B*T, 4)
+    labels_flat = action_label.reshape(B * T)              # (B*T,)
+
+    ce_per_step = F.cross_entropy(logits_flat, labels_flat, reduction="none")  # (B*T,)
+    ce_per_sample = ce_per_step.reshape(B, T).mean(dim=-1)                     # (B,)
+
+    assert ce_per_sample.shape == action_mask.shape, (
+        f"{ce_per_sample.shape} != {action_mask.shape}"
+    )
+    action_loss = (ce_per_sample * action_mask).mean() / (action_mask.mean() + 1e-2)
+
+    # Per-step accuracy (useful for logging, not backpropagated)
+    preds = logits_flat.argmax(dim=-1)
+    acc = (preds == labels_flat).float().mean()
+
+    total_loss = alpha * 1e-2 * dist_loss + (1 - alpha) * action_loss
+
+    return {
+        "dist_loss": dist_loss,
+        "action_loss": action_loss,
+        "discrete_action_acc": acc,
+        "total_loss": total_loss,
+    }
+
+
+def train_vln(
+    model: nn.Module,
+    optimizer: Adam,
+    dataloader: DataLoader,
+    transform: transforms,
+    device: torch.device,
+    project_folder: str,
+    normalized: bool,
+    epoch: int,
+    alpha: float = 0.5,
+    print_log_freq: int = 100,
+    wandb_log_freq: int = 10,
+    image_log_freq: int = 1000,
+    num_images_log: int = 8,
+    use_wandb: bool = True,
+    use_tqdm: bool = True,
+    **kwargs,
+):
+    """
+    Train the model for one epoch with VLN-CE discrete action labels.
+
+    The model must have been initialised with ``discrete_actions=True`` so
+    that it outputs (dist_pred, action_logits) where action_logits has shape
+    (B, len_traj_pred, 4).
+    """
+    predict_dists = kwargs.get("predict_dists", True)
+    goal_type = kwargs.get("goal_type", "image")
+    obs_type = kwargs.get("obs_type", "image")
+
+    model.train()
+    dist_loss_logger = Logger("dist_loss", "train", window_size=print_log_freq)
+    action_loss_logger = Logger("action_loss", "train", window_size=print_log_freq)
+    acc_logger = Logger("discrete_action_acc", "train", window_size=print_log_freq)
+    total_loss_logger = Logger("total_loss", "train", window_size=print_log_freq)
+    loggers = {
+        "dist_loss": dist_loss_logger,
+        "action_loss": action_loss_logger,
+        "discrete_action_acc": acc_logger,
+        "total_loss": total_loss_logger,
+    }
+
+    num_batches = len(dataloader)
+    tqdm_iter = tqdm.tqdm(
+        dataloader,
+        disable=not use_tqdm,
+        dynamic_ncols=True,
+        desc=f"Training VLN epoch {epoch}",
+    )
+    for i, data in enumerate(tqdm_iter):
+        (
+            obs_image,
+            goal_image,
+            action_label,
+            dist_label,
+            goal_pos,
+            dataset_index,
+            action_mask,
+        ) = data
+
+        obs_image, viz_obs_image = get_obs_image(obs_image, obs_type, transform, device)
+        goal_image, viz_goal_image = get_goal_image(
+            goal_image, goal_type, transform, device, obs_image
+        )
+
+        model_outputs = model(obs_image, goal_image)
+
+        if predict_dists:
+            dist_label = dist_label.to(device)
+        action_label = action_label.to(device)   # (B, T) int64
+        action_mask = action_mask.to(device)
+
+        optimizer.zero_grad()
+
+        dist_pred, action_logits = model_outputs   # (B,1) and (B, T, 4)
+        losses = _compute_losses_vln(
+            dist_label=dist_label if predict_dists else None,
+            action_label=action_label,
+            dist_pred=dist_pred,
+            action_logits=action_logits,
+            alpha=alpha,
+            action_mask=action_mask,
+        )
+
+        losses["total_loss"].backward()
+        optimizer.step()
+
+        for key, value in losses.items():
+            if key in loggers:
+                loggers[key].log_data(value.item())
+
+        data_log = {}
+        for key, logger in loggers.items():
+            data_log[logger.full_name()] = logger.latest()
+            if i % print_log_freq == 0 and print_log_freq != 0:
+                print(
+                    f"(epoch {epoch}) (batch {i}/{num_batches - 1}) {logger.display()}"
+                )
+
+        if use_wandb and i % wandb_log_freq == 0 and wandb_log_freq != 0:
+            wandb.log(data_log, commit=True)
+
+
+def evaluate_vln(
+    eval_type: str,
+    model: nn.Module,
+    dataloader: DataLoader,
+    transform: transforms,
+    device: torch.device,
+    project_folder: str,
+    normalized: bool,
+    epoch: int = 0,
+    alpha: float = 0.5,
+    num_images_log: int = 8,
+    use_wandb: bool = True,
+    eval_fraction: float = 1.0,
+    use_tqdm: bool = True,
+    **kwargs,
+):
+    """Evaluate the model on the given dataset with VLN-CE discrete actions."""
+    predict_dists = kwargs.get("predict_dists", True)
+    goal_type = kwargs.get("goal_type", "image")
+    obs_type = kwargs.get("obs_type", "image")
+
+    model.eval()
+    dist_loss_logger = Logger("dist_loss", eval_type)
+    action_loss_logger = Logger("action_loss", eval_type)
+    acc_logger = Logger("discrete_action_acc", eval_type)
+    total_loss_logger = Logger("total_loss", eval_type)
+    loggers = {
+        "dist_loss": dist_loss_logger,
+        "action_loss": action_loss_logger,
+        "discrete_action_acc": acc_logger,
+        "total_loss": total_loss_logger,
+    }
+
+    num_batches = len(dataloader)
+    num_batches = max(int(num_batches * eval_fraction), 1)
+
+    with torch.no_grad():
+        tqdm_iter = tqdm.tqdm(
+            itertools.islice(dataloader, num_batches),
+            total=num_batches,
+            disable=not use_tqdm,
+            dynamic_ncols=True,
+            desc=f"Evaluating VLN {eval_type} epoch {epoch}",
+        )
+        for i, data in enumerate(tqdm_iter):
+            (
+                obs_image,
+                goal_image,
+                action_label,
+                dist_label,
+                goal_pos,
+                dataset_index,
+                action_mask,
+            ) = data
+
+            obs_image, _ = get_obs_image(obs_image, obs_type, transform, device)
+            goal_image, _ = get_goal_image(
+                goal_image, goal_type, transform, device, obs_image
+            )
+
+            dist_pred, action_logits = model(obs_image, goal_image)
+
+            if predict_dists:
+                dist_label = dist_label.to(device)
+            action_label = action_label.to(device)
+            action_mask = action_mask.to(device)
+
+            losses = _compute_losses_vln(
+                dist_label=dist_label if predict_dists else None,
+                action_label=action_label,
+                dist_pred=dist_pred,
+                action_logits=action_logits,
+                alpha=alpha,
+                action_mask=action_mask,
+            )
+
+            for key, value in losses.items():
+                if key in loggers:
+                    loggers[key].log_data(value.item())
+
+    # Log averaged metrics
+    data_log = {logger.full_name(): logger.average() for logger in loggers.values()}
+    print(f"[{eval_type} epoch {epoch}] " + " | ".join(
+        f"{k}={v:.4f}" for k, v in data_log.items()
+    ))
+    if use_wandb:
+        wandb.log(data_log, commit=False)
+
+    return (
+        dist_loss_logger.average(),
+        action_loss_logger.average(),
+        total_loss_logger.average(),
+    )
