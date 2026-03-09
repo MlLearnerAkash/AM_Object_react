@@ -1,0 +1,93 @@
+project_name: object_react_vln
+run_name: object_react_vln
+
+# KEY PARAMS
+mode: train  # [train, vis, eval]
+predict_dists: True
+
+# Input / goal representation  (same as pretrained object_react model)
+goal_type: "image_mask_enc"   # wayobject costmap — loads GoalEncoder weights from pretrained
+obs_type: "image"             # current RGB observation stack
+dims: 8                       # positional-encoding channels for mask costmap
+goal_uses_context: False
+
+# VLN-CE discrete action output
+# Actions: STOP=0, FORWARD=1, LEFT=2, RIGHT=3
+discrete_actions: True
+vln_fwd_threshold: 0.05        # metres  — minimum displacement to count as movement
+vln_turn_threshold: 0.20       # radians — minimum |yaw delta| to count as a turn (~11.5 deg)
+learn_angle: False             # not applicable for discrete actions
+
+# Pretrained weights (GoalEncoder + fusion layers transfer automatically)
+# Set load_run to your existing object_react checkpoint to warm-start:
+#   load_run: logs/object_react/<run_name>
+# The new discrete_action_predictor head is always trained from scratch.
+
+# Training setup
+use_wandb: True
+batch_size: 64
+eval_batch_size: 32
+epochs: 50
+gpu_ids: [0]
+num_workers: 8
+eval_num_workers: 4
+lr: 5e-4
+optimizer: adam
+scheduler: null
+seed: 0
+
+# Model
+model_type: gnm
+obs_encoding_size: 1024
+goal_encoding_size: 1024
+
+# Normalise the goal-position visualisation coordinate
+normalize: True
+
+# Context
+context_type: temporal  # [temporal, randomized]
+context_size: 5
+
+# Tradeoff: alpha * dist_loss + (1-alpha) * action_loss
+alpha: 0.5
+
+# Distance filtering for sampling
+distance:
+  min_dist_cat: 0
+  max_dist_cat: 20
+action:
+  min_dist_cat: 2
+  max_dist_cat: 10
+close_far_threshold: 10
+
+# Trajectory prediction horizon (number of discrete actions predicted per step)
+len_traj_pred: 10
+
+# Image dimensions — must match pretrained model
+image_size: [85, 64]  # [width, height]
+
+# Costmap precomputation (identical to object_react.yaml)
+precomputed_filename: ../custom_dataset/costmaps.h5
+pl_perturb_ratio: 0.3
+pl_perturb_type: max_val
+mask_crop_ratio: 1.0
+use_mask_grad: False
+
+datasets:
+  my_custom_dataset:
+    data_folder: ../custom_dataset/
+    train: ../custom_dataset/train/
+    test:  ../custom_dataset/test/
+    end_slack: 3          # ignore last N frames per trajectory
+    goals_per_obs: 2
+    negative_mining: true
+    images_subfolder: images
+
+# Logging
+print_log_freq: 100
+image_log_freq: 1000
+num_images_log: 8
+pairwise_test_freq: 20
+wandb_log_freq: 10
+eval_freq: 1
+eval_fraction: 0.25
