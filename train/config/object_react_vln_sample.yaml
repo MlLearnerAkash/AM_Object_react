@@ -1,0 +1,66 @@
+action:
+  max_dist_cat: 10
+  min_dist_cat: 2
+alpha: 0.5
+batch_size: 4
+close_far_threshold: 10
+context_size: 5
+context_type: temporal
+datasets:
+  my_custom_dataset:
+    data_folder: /data/ws/VLN-CE/controller/object_react/custom_dataset
+    train_data_folder: /data/ws/VLN-CE/controller/object_react/custom_dataset/train
+    test_data_folder: /data/ws/VLN-CE/controller/object_react/custom_dataset/test
+    end_slack: 3
+    goals_per_obs: 1
+    negative_mining: true
+    test: /data/ws/VLN-CE/controller/object_react/custom_dataset/test
+    train: /data/ws/VLN-CE/controller/object_react/custom_dataset/train
+    waypoint_spacing: 1
+dims: 8
+discrete_actions: true
+distance:
+  max_dist_cat: 20
+  min_dist_cat: 0
+epochs: 3
+eval_batch_size: 4
+eval_fraction: 1.0
+eval_freq: 1
+eval_num_workers: 0
+goal_encoding_size: 1024
+goal_type: image
+goal_uses_context: false
+gpu_ids:
+- 0
+image_log_freq: 0
+image_size:
+- 85
+- 64
+learn_angle: false
+len_traj_pred: 1
+lr: 5e-4
+mask_crop_ratio: 1.0
+mode: train
+model_type: gnm
+normalize: true
+num_images_log: 8
+num_workers: 0
+obs_encoding_size: 1024
+obs_type: image
+optimizer: adam
+pairwise_test_freq: 20
+pl_perturb_ratio: 0.3
+pl_perturb_type: max_val
+predict_dists: true
+print_log_freq: 1
+project_name: object_react_vln_sample
+run_name: object_react_vln_sample
+scheduler: null
+seed: 0
+use_mask_grad: false
+use_wandb: false
+vln_fwd_threshold: 0.05
+vln_turn_threshold: 0.2
+
+use_wandb: True
+wandb_log_freq: 9999

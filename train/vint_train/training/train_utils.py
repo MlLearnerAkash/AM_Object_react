@@ -1369,6 +1369,8 @@ def _compute_losses_vln(
     action_logits: torch.Tensor,
     alpha: float,
     action_mask: torch.Tensor,
+    class_weights: Optional[torch.Tensor] = None,
+    focal_gamma: float = 0.0,
 ):
     """
     Compute losses for VLN-CE discrete action prediction.
@@ -1380,6 +1382,12 @@ def _compute_losses_vln(
         action_logits: (B, T, 4)  raw logits for 4 VLN-CE actions
         alpha:         weight for distance loss
         action_mask:   (B,)       1 for valid samples
+        class_weights: (4,) optional per-class weights for cross-entropy
+                       (e.g. inverse class frequency to counter imbalance)
+        focal_gamma:   focal-loss exponent γ (0 = plain cross-entropy).
+                       When > 0, each CE term is multiplied by (1-pₜ)^γ so
+                       that easy / dominant-class predictions are down-weighted.
+                       Typical value: 2.0.
     """
     if dist_label is None or dist_pred is None:
         dist_loss = torch.tensor(0.0, device=action_logits.device)
@@ -1390,7 +1398,27 @@ def _compute_losses_vln(
     logits_flat = action_logits.reshape(B * T, C)          # (B*T, 4)
     labels_flat = action_label.reshape(B * T)              # (B*T,)
 
-    ce_per_step = F.cross_entropy(logits_flat, labels_flat, reduction="none")  # (B*T,)
+    if class_weights is not None:
+        class_weights = class_weights.to(action_logits.device)
+
+    # Unweighted CE to compute p_t for the focal modulator
+    ce_unweighted = F.cross_entropy(logits_flat, labels_flat, reduction="none")  # (B*T,)
+
+    if focal_gamma > 0.0:
+        # p_t = probability assigned to the correct class
+        pt = torch.exp(-ce_unweighted)                              # (B*T,)
+        focal_mod = (1.0 - pt) ** focal_gamma                       # (B*T,)
+        # Apply class weights separately so both effects combine
+        if class_weights is not None:
+            cw_per_sample = class_weights[labels_flat]              # (B*T,)
+            ce_per_step = focal_mod * cw_per_sample * ce_unweighted
+        else:
+            ce_per_step = focal_mod * ce_unweighted
+    else:
+        ce_per_step = F.cross_entropy(
+            logits_flat, labels_flat, weight=class_weights, reduction="none"
+        )  # (B*T,)
+
     ce_per_sample = ce_per_step.reshape(B, T).mean(dim=-1)                     # (B,)
 
     assert ce_per_sample.shape == action_mask.shape, (
@@ -1440,6 +1468,9 @@ def train_vln(
     predict_dists = kwargs.get("predict_dists", True)
     goal_type = kwargs.get("goal_type", "image")
     obs_type = kwargs.get("obs_type", "image")
+    _cw = kwargs.get("vln_class_weights", None)
+    class_weights = torch.tensor(_cw, dtype=torch.float32) if _cw is not None else None
+    focal_gamma = float(kwargs.get("focal_gamma", 0.0))
 
     model.train()
     dist_loss_logger = Logger("dist_loss", "train", window_size=print_log_freq)
@@ -1493,6 +1524,8 @@ def train_vln(
             action_logits=action_logits,
             alpha=alpha,
             action_mask=action_mask,
+            class_weights=class_weights,
+            focal_gamma=focal_gamma,
         )
 
         losses["total_loss"].backward()
@@ -1534,6 +1567,9 @@ def evaluate_vln(
     predict_dists = kwargs.get("predict_dists", True)
     goal_type = kwargs.get("goal_type", "image")
     obs_type = kwargs.get("obs_type", "image")
+    _cw = kwargs.get("vln_class_weights", None)
+    class_weights = torch.tensor(_cw, dtype=torch.float32) if _cw is not None else None
+    focal_gamma = float(kwargs.get("focal_gamma", 0.0))
 
     model.eval()
     dist_loss_logger = Logger("dist_loss", eval_type)
@@ -1588,6 +1624,8 @@ def evaluate_vln(
                 action_logits=action_logits,
                 alpha=alpha,
                 action_mask=action_mask,
+                class_weights=class_weights,
+                focal_gamma=focal_gamma,
             )
 
             for key, value in losses.items():

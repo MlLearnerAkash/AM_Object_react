@@ -10,7 +10,7 @@ from os.path import basename, normpath
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import DataLoader, ConcatDataset, WeightedRandomSampler, SubsetRandomSampler
 from torch.optim import Adam, AdamW
 from torchvision import transforms
 import torch.backends.cudnn as cudnn
@@ -48,6 +48,57 @@ import matplotlib.pyplot as plt
 plt.ioff()
 
 
+def _build_undersampling_sampler(dataset):
+    """Undersample the FORWARD (majority) class down to the size of the largest
+    minority class, then shuffle everything with SubsetRandomSampler.
+
+    Reads labels directly from the trajectory cache — fast and deterministic.
+    Only samples that can produce action_mask=1 are eligible.
+    """
+    print("[undersampling] Scanning dataset for action labels...")
+    # dataset may be a ConcatDataset wrapping multiple ViNT_Dataset instances
+    sub_datasets = dataset.datasets if hasattr(dataset, "datasets") else [dataset]
+
+    # global_offset: position of each sub-dataset's first sample in the ConcatDataset
+    offset = 0
+    class_indices = {}  # {action_int: [global_idx, ...]}
+    for sub_ds in sub_datasets:
+        for local_i, (traj_name, curr_time, max_goal_dist) in enumerate(sub_ds.index_to_data):
+            traj_data = sub_ds._get_trajectory(traj_name)
+            gt_actions = traj_data["action"]
+            action = int(gt_actions[min(curr_time, len(gt_actions) - 1)])
+            can_be_valid = max_goal_dist > sub_ds.min_action_distance
+            if can_be_valid:
+                class_indices.setdefault(action, []).append(offset + local_i)
+        offset += len(sub_ds.index_to_data)
+
+    counts = {a: len(idxs) for a, idxs in class_indices.items()}
+    print(f"[undersampling] Eligible samples per class: {counts}")
+
+    # Target size = largest minority class (all non-FORWARD classes)
+    FORWARD = 1
+    minority_counts = [n for a, n in counts.items() if a != FORWARD]
+    if not minority_counts:
+        # No minority classes at all — fall back to all samples
+        all_indices = [i for idxs in class_indices.values() for i in idxs]
+        np.random.shuffle(all_indices)
+        return SubsetRandomSampler(all_indices)
+
+    target = max(minority_counts)
+    print(f"[undersampling] Capping FORWARD from {counts.get(FORWARD, 0)} → {target}")
+
+    kept = []
+    for action, idxs in class_indices.items():
+        arr = np.array(idxs)
+        if action == FORWARD and len(arr) > target:
+            arr = np.random.choice(arr, size=target, replace=False)
+        kept.extend(arr.tolist())
+
+    np.random.shuffle(kept)
+    print(f"[undersampling] Total samples after undersampling: {len(kept)}")
+    return SubsetRandomSampler(kept)
+
+
 def ready_dataloaders(config, data_config, dataset_name, data_split_type, **kwargs):
 
     # Load the data
@@ -73,8 +124,13 @@ def ready_dataloaders(config, data_config, dataset_name, data_split_type, **kwar
 
         for data_split_type in ["train", "test"]:
             if data_split_type in data_config:
+                # Allow per-split data_folder; fall back to the shared one.
+                split_data_folder = data_config.get(
+                    f"{data_split_type}_data_folder",
+                    data_config.get("data_folder", data_config[data_split_type]),
+                )
                 dataset = ViNT_Dataset(
-                    data_folder=data_config["data_folder"],
+                    data_folder=split_data_folder,
                     data_split_folder=data_config[data_split_type],
                     dataset_name=dataset_name,
                     image_size=config["image_size"],
@@ -105,14 +161,25 @@ def ready_dataloaders(config, data_config, dataset_name, data_split_type, **kwar
     # combine all the datasets from different robots
     train_dataset = ConcatDataset(train_dataset)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config["batch_size"],
-        shuffle=True,
-        num_workers=config["num_workers"],
-        drop_last=False,
-        persistent_workers=True if config["num_workers"] > 0 else False,
-    )
+    if config.get("use_oversampling", False):
+        sampler = _build_undersampling_sampler(train_dataset)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config["batch_size"],
+            sampler=sampler,          # replaces shuffle=True
+            num_workers=config["num_workers"],
+            drop_last=False,
+            persistent_workers=True if config["num_workers"] > 0 else False,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config["batch_size"],
+            shuffle=True,
+            num_workers=config["num_workers"],
+            drop_last=False,
+            persistent_workers=True if config["num_workers"] > 0 else False,
+        )
 
     if "eval_batch_size" not in config:
         config["eval_batch_size"] = config["batch_size"]
@@ -314,6 +381,9 @@ def main(config):
         "discrete_actions": config.get("discrete_actions", False),
         "vln_fwd_threshold": config.get("vln_fwd_threshold", 0.05),
         "vln_turn_threshold": config.get("vln_turn_threshold", 0.2),
+        # Imbalance-mitigation settings
+        "vln_class_weights": config.get("vln_class_weights", None),
+        "focal_gamma": config.get("focal_gamma", 0.0),
     }
 
     assert config["distance"]["min_dist_cat"] < config["distance"]["max_dist_cat"]

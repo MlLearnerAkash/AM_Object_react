@@ -533,8 +533,25 @@ def parse_args():
         "--checkpoint", required=True,
         help="Path to checkpoint .pth (e.g. logs/object_react_vln/<run>/latest.pth)",
     )
+    # ── dataset-split evaluation mode ─────────────────────────────────────────
     p.add_argument(
-        "--image", nargs="+", required=True, metavar="IMG",
+        "--eval_split", action="store_true",
+        help=(
+            "Split the training LMDB dataset into train/val and evaluate the "
+            "model on the val split, printing GT vs predicted labels and a "
+            "confusion matrix.  When set, --image and goal arguments are ignored."
+        ),
+    )
+    p.add_argument(
+        "--val_fraction", type=float, default=0.2, metavar="F",
+        help="Fraction of the training dataset to use as val (default: 0.2).",
+    )
+    p.add_argument(
+        "--split_seed", type=int, default=42, metavar="SEED",
+        help="Random seed for the train/val split (default: 42).",
+    )
+    p.add_argument(
+        "--image", nargs="+", required=False, metavar="IMG",
         help=(
             "One or more RGB image paths, ordered oldest → newest "
             "(the last is the current frame). If fewer than context_size+1 "
@@ -604,6 +621,20 @@ def main():
     model = build_model(config).to(device)
     model = load_checkpoint(model, args.checkpoint, config["model_type"], device)
     model.eval()
+
+    # ── dataset-split evaluation mode ────────────────────────────────────────
+    if args.eval_split:
+        evaluate_on_dataset_split(
+            config=config,
+            model=model,
+            val_fraction=args.val_fraction,
+            seed=args.split_seed,
+            device=device,
+        )
+        return
+
+    if not args.image:
+        raise ValueError("--image is required when not using --eval_split.")
 
     # ── observation tensor ────────────────────────────────────────────────────
     image_size   = tuple(config["image_size"])   # (W, H)
@@ -775,6 +806,210 @@ def run_inference(
         goal_tensor = torch.zeros(1, dims, 60, 80, device=device)
 
     return predict(model, obs_tensor, goal_tensor)
+
+
+def evaluate_on_dataset_split(
+    config: dict,
+    model: GNM,
+    val_fraction: float = 0.2,
+    seed: int = 42,
+    device: torch.device = None,
+    batch_size: int = 1,
+) -> dict:
+    """
+    Build the training LMDB dataset, split it into train/val, run the loaded
+    model on the val split, and print per-sample GT vs predicted labels plus
+    a confusion matrix with per-class accuracy.
+
+    The dataset is built from ``config["datasets"]`` exactly the same way
+    ``train.py`` does it, so the samples (obs_image, goal_image, action_label,
+    …) are identical to what the model saw during training.
+
+    Args:
+        config:       Config dict from ``load_config()``.
+        model:        Loaded GNM model (already on ``device``).
+        val_fraction: Fraction of the dataset to use for validation (default 0.2).
+        seed:         Random seed for the train/val split (default 42).
+        device:       Torch device.  If None, inferred from model parameters.
+        batch_size:   DataLoader batch size for the val pass (default 1).
+
+    Returns:
+        dict with keys:
+            accuracy        (float)             — overall top-1 accuracy on val
+            per_class_acc   (dict[str, float])  — per-class accuracy
+            confusion        (dict)             — raw counts confusion[gt][pred]
+            predictions     (list[dict])        — per-sample results
+
+    Example::
+
+        config = load_config("config/object_react_vln.yaml")
+        model  = build_model(config)
+        model  = load_checkpoint(model, "logs/object_react_vln/my_run/latest.pth", "gnm")
+        results = evaluate_on_dataset_split(config, model)
+        print(f"Val accuracy: {results['accuracy']:.2%}")
+    """
+    from vint_train.data.vint_dataset import ViNT_Dataset
+    from torch.utils.data import DataLoader, Subset, random_split
+
+    if device is None:
+        device = next(model.parameters()).device
+
+    # ── Build the dataset ────────────────────────────────────────────────────
+    ds_configs = config.get("datasets", {})
+    if not ds_configs:
+        raise ValueError("No 'datasets' key found in config.")
+
+    all_datasets = []
+    for dataset_name, ds_cfg in ds_configs.items():
+        data_folder = ds_cfg.get("data_folder", ds_cfg.get("train", ""))
+        split_folder = ds_cfg.get("train", data_folder)
+        waypoint_spacing = ds_cfg.get("waypoint_spacing", 1)
+
+        ds = ViNT_Dataset(
+            data_folder=data_folder,
+            data_split_folder=split_folder,
+            dataset_name=dataset_name,
+            image_size=config["image_size"],
+            waypoint_spacing=waypoint_spacing,
+            min_dist_cat=config["distance"]["min_dist_cat"],
+            max_dist_cat=config["distance"]["max_dist_cat"],
+            min_action_distance=config["action"]["min_dist_cat"],
+            max_action_distance=config["action"]["max_dist_cat"],
+            negative_mining=ds_cfg.get("negative_mining", False),
+            len_traj_pred=config["len_traj_pred"],
+            learn_angle=config.get("learn_angle", False),
+            context_size=config["context_size"],
+            context_type=config["context_type"],
+            end_slack=ds_cfg.get("end_slack", 0),
+            goals_per_obs=ds_cfg.get("goals_per_obs", 1),
+            normalize=config.get("normalize", True),
+            obs_type=config.get("obs_type", "image"),
+            goal_type=config.get("goal_type", "image"),
+            # object_react / VLN kwargs forwarded transparently
+            precomputed_filename=config.get("precomputed_filename", ""),
+            pl_perturb_ratio=config.get("pl_perturb_ratio", 0.3),
+            pl_perturb_type=config.get("pl_perturb_type", "max_val"),
+            mask_crop_ratio=config.get("mask_crop_ratio", 1.0),
+            use_mask_grad=config.get("use_mask_grad", False),
+            dims=config.get("dims", 8),
+            discrete_actions=config.get("discrete_actions", False),
+            vln_fwd_threshold=config.get("vln_fwd_threshold", 0.05),
+            vln_turn_threshold=config.get("vln_turn_threshold", 0.20),
+            goal_uses_context=config.get("goal_uses_context", False),
+        )
+        all_datasets.append(ds)
+        print(f"[eval_split] Loaded '{dataset_name}': {len(ds)} samples")
+
+    # Concatenate in case of multiple datasets
+    from torch.utils.data import ConcatDataset
+    full_ds = ConcatDataset(all_datasets) if len(all_datasets) > 1 else all_datasets[0]
+    n_total = len(full_ds)
+    n_val   = max(1, int(n_total * val_fraction))
+    n_train = n_total - n_val
+
+    generator = torch.Generator().manual_seed(seed)
+    train_subset, val_subset = random_split(full_ds, [n_train, n_val], generator=generator)
+    print(f"[eval_split] Split: {n_train} train  |  {n_val} val  (seed={seed})")
+
+    val_loader = DataLoader(
+        val_subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
+
+    # ── Run inference on val set ─────────────────────────────────────────────
+    model.eval()
+    predict_dists = config.get("predict_dists", True)
+
+    per_sample = []
+    correct = 0
+    total   = 0
+
+    # confusion[gt_idx][pred_idx] = count
+    num_actions = 4
+    confusion = [[0] * num_actions for _ in range(num_actions)]
+
+    print("\n" + "=" * 72)
+    print(f"{'#':>4}  {'GT':>8}  {'PRED':>8}  {'✓':>2}  {'Probs (S / F / L / R)':>24}")
+    print("-" * 72)
+
+    sample_idx = 0
+    with torch.no_grad():
+        for batch in val_loader:
+            obs_image, goal_image, action_label, dist_label, goal_pos, dataset_index, action_mask = batch
+
+            obs_image   = obs_image.to(device)
+            goal_image  = goal_image.to(device)
+            action_label = action_label.to(device)   # (B, T) int64
+
+            _, action_logits = model(obs_image, goal_image)  # (B, T, 4)
+            probs_all = torch.softmax(action_logits, dim=-1)  # (B, T, 4)
+
+            B = obs_image.shape[0]
+            for b in range(B):
+                # Use the first prediction step (T=0)
+                gt_idx   = int(action_label[b, 0].item())
+                pred_idx = int(probs_all[b, 0].argmax().item())
+                probs_t0 = probs_all[b, 0].cpu().tolist()
+
+                gt_name   = ACTION_NAMES.get(gt_idx,   str(gt_idx))
+                pred_name = ACTION_NAMES.get(pred_idx, str(pred_idx))
+                ok        = gt_idx == pred_idx
+
+                confusion[gt_idx][pred_idx] += 1
+                correct += int(ok)
+                total   += 1
+
+                prob_str = "  ".join(f"{p:.2f}" for p in probs_t0)
+                tick     = "✓" if ok else "✗"
+                print(f"{sample_idx:>4}  {gt_name:>8}  {pred_name:>8}  {tick:>2}  [{prob_str}]")
+
+                per_sample.append({
+                    "sample_idx":  sample_idx,
+                    "gt_action":   gt_name,
+                    "pred_action": pred_name,
+                    "correct":     ok,
+                    "probs":       probs_t0,
+                })
+                sample_idx += 1
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    overall_acc = correct / total if total > 0 else 0.0
+
+    print("=" * 72)
+    print(f"\nOverall accuracy: {correct}/{total} = {overall_acc:.2%}\n")
+
+    # Per-class accuracy
+    per_class_acc = {}
+    print("Per-class accuracy:")
+    for cls_idx, cls_name in ACTION_NAMES.items():
+        cls_total   = sum(confusion[cls_idx])
+        cls_correct = confusion[cls_idx][cls_idx]
+        acc = cls_correct / cls_total if cls_total > 0 else float("nan")
+        per_class_acc[cls_name] = acc
+        print(f"  {cls_name:>8}: {cls_correct:>3}/{cls_total:>3} = "
+              f"{acc:.2%}" if cls_total > 0 else f"  {cls_name:>8}: — (no samples)")
+
+    # Confusion matrix
+    print("\nConfusion matrix (rows=GT, cols=Pred):")
+    header = "         " + "  ".join(f"{ACTION_NAMES[i]:>8}" for i in range(num_actions))
+    print(header)
+    for r in range(num_actions):
+        row_name  = ACTION_NAMES[r]
+        row_total = sum(confusion[r])
+        if row_total == 0:
+            continue
+        row_str = "  ".join(f"{confusion[r][c]:>8}" for c in range(num_actions))
+        print(f"  {row_name:>8}  {row_str}")
+    print()
+
+    return {
+        "accuracy":      overall_acc,
+        "per_class_acc": per_class_acc,
+        "confusion":     confusion,
+        "predictions":   per_sample,
+    }
 
 
 if __name__ == "__main__":

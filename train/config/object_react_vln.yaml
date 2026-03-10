@@ -27,7 +27,7 @@ learn_angle: False             # not applicable for discrete actions
 use_wandb: True
 batch_size: 64
 eval_batch_size: 32
-epochs: 50
+epochs: 30
 gpu_ids: [0]
 num_workers: 8
 eval_num_workers: 4
@@ -46,22 +46,34 @@ normalize: True
 
 # Context
 context_type: temporal  # [temporal, randomized]
-context_size: 5
+context_size: 1
 
 # Tradeoff: alpha * dist_loss + (1-alpha) * action_loss
 alpha: 0.5
+
+# Inverse-frequency class weights [STOP, FORWARD, LEFT, RIGHT].
+# Computed from training distribution: FORWARD=79.8%, LEFT=13.5%, RIGHT=6.7%, STOP=0%.
+# STOP gets a small non-zero weight so the head doesn't diverge if STOP appears at test time.
+vln_class_weights: [0.01, 0.313, 1.854, 3.708]
+
+# Focal loss gamma. 2.0 is the standard value (RetinaNet). It down-weights easy
+# (majority FORWARD) predictions so minority classes get proportionally larger gradients.
+# Combines with class weights: focal handles the easy/hard axis, weights handle frequency.
+focal_gamma: 2.0
+
+use_oversampling: True  # undersample FORWARD to max(LEFT, RIGHT) before each epoch
 
 # Distance filtering for sampling
 distance:
   min_dist_cat: 0
   max_dist_cat: 20
 action:
-  min_dist_cat: 2
-  max_dist_cat: 10
+  min_dist_cat: 0  # widened from 2: include short-range goals so more samples get action_mask=1
+  max_dist_cat: 20  # widened from 10: match distance range
 close_far_threshold: 10
 
 # Trajectory prediction horizon (number of discrete actions predicted per step)
-len_traj_pred: 10
+len_traj_pred: 1
 
 # Image dimensions — must match pretrained model
 image_size: [85, 64]  # [width, height]
