@@ -7,6 +7,7 @@ from prettytable import PrettyTable
 from vint_train.training.train_utils import train, evaluate
 from vint_train.training.train_utils import train_nomad, evaluate_nomad
 from vint_train.training.train_utils import train_vln, evaluate_vln
+from vint_train.training.train_utils import train_vw, evaluate_vw
 
 
 import torch
@@ -392,6 +393,120 @@ def train_eval_loop_vln(
             loader = test_dataloaders[dataset_type]
 
             test_dist_loss, test_action_loss, total_eval_loss = evaluate_vln(
+                eval_type=dataset_type,
+                model=model,
+                dataloader=loader,
+                transform=transform,
+                device=device,
+                project_folder=project_folder,
+                normalized=normalized,
+                epoch=epoch,
+                alpha=alpha,
+                num_images_log=num_images_log,
+                use_wandb=use_wandb,
+                eval_fraction=eval_fraction,
+                **kwargs,
+            )
+            avg_total_test_loss.append(total_eval_loss)
+
+        checkpoint = {
+            "epoch": epoch,
+            "model": model,
+            "optimizer": optimizer,
+            "avg_total_test_loss": np.mean(avg_total_test_loss),
+            "scheduler": scheduler,
+            "wandb_run_id": wandb.run.id if use_wandb else None,
+            "wandb_run_dir": wandb.run.dir if use_wandb else None,
+        }
+        wandb.log({}, commit=False)
+
+        if scheduler is not None:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(np.mean(avg_total_test_loss))
+            else:
+                scheduler.step()
+        wandb.log(
+            {
+                "avg_total_test_loss": np.mean(avg_total_test_loss),
+                "lr": optimizer.param_groups[0]["lr"],
+            },
+            commit=False,
+        )
+
+        try:
+            numbered_path = os.path.join(project_folder, f"{epoch}.pth")
+            torch.save(checkpoint, latest_path)
+            torch.save(checkpoint, numbered_path)
+        except Exception as e:
+            print("Error saving model", e)
+
+    wandb.log({})
+    print()
+
+
+# ============================================================================
+# Object-React continuous (v, w) training loop
+# ============================================================================
+
+def train_eval_loop_vw(
+    train_model: bool,
+    model: nn.Module,
+    optimizer,
+    scheduler,
+    dataloader,
+    test_dataloaders: Dict[str, object],
+    transform,
+    epochs: int,
+    device: torch.device,
+    project_folder: str,
+    normalized: bool,
+    wandb_log_freq: int = 10,
+    print_log_freq: int = 100,
+    image_log_freq: int = 1000,
+    num_images_log: int = 8,
+    current_epoch: int = 0,
+    alpha: float = 0.5,
+    use_wandb: bool = True,
+    eval_fraction: float = 0.25,
+    **kwargs,
+):
+    """
+    Train and evaluate the model for several epochs using continuous (v, w)
+    action regression labels.
+
+    Mirrors ``train_eval_loop_vln`` in structure but delegates to
+    ``train_vw`` / ``evaluate_vw`` which use MSE loss on (v, w) pairs.
+    """
+    assert 0 <= alpha <= 1
+    latest_path = os.path.join(project_folder, "latest.pth")
+
+    for epoch in range(current_epoch, epochs):
+        if train_model:
+            print(f"Start V/W Training Epoch {epoch}/{epochs}")
+            train_vw(
+                model=model,
+                optimizer=optimizer,
+                dataloader=dataloader,
+                transform=transform,
+                device=device,
+                project_folder=project_folder,
+                normalized=normalized,
+                epoch=epoch,
+                alpha=alpha,
+                print_log_freq=print_log_freq,
+                wandb_log_freq=wandb_log_freq,
+                image_log_freq=image_log_freq,
+                num_images_log=num_images_log,
+                use_wandb=use_wandb,
+                **kwargs,
+            )
+
+        avg_total_test_loss = []
+        for dataset_type in test_dataloaders:
+            print(f"Start {dataset_type} V/W Testing Epoch {epoch}/{epochs}")
+            loader = test_dataloaders[dataset_type]
+
+            _, _, total_eval_loss = evaluate_vw(
                 eval_type=dataset_type,
                 model=model,
                 dataloader=loader,

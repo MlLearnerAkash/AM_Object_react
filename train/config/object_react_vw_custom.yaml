@@ -1,0 +1,90 @@
+project_name: object_react_vw_custom
+run_name: object_react_vw_custom
+
+# ── Mode ─────────────────────────────────────────────────────────────────────
+mode: train
+
+# ── Input / goal representation (identical to original object_react) ─────────
+goal_type: "image_mask_enc"   # topometric costmap as goal
+obs_type: "disabled"          # no observation image
+dims: 8
+goal_uses_context: False
+
+# ── Continuous (v, w) output mode ────────────────────────────────────────────
+output_vw: True
+discrete_actions: False
+learn_angle: False
+predict_dists: True
+
+# ── Training setup ────────────────────────────────────────────────────────────
+use_wandb: True
+batch_size: 16
+eval_batch_size: 16
+epochs: 150
+gpu_ids: [0]
+num_workers: 4
+eval_num_workers: 2
+lr: 5e-4
+optimizer: adam
+scheduler: null
+seed: 0
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model_type: gnm
+obs_encoding_size: 1024
+goal_encoding_size: 1024
+
+# ── Normalise action labels (recommended) ─────────────────────────────────────
+normalize: True
+
+# ── Context ───────────────────────────────────────────────────────────────────
+context_type: temporal
+context_size: 1     # matches existing pkl: dataset_dist_0_to_20_context_temporal_n1_slack_3.pkl
+
+# ── Loss tradeoff ─────────────────────────────────────────────────────────────
+alpha: 0.5
+
+# ── Distance / action sampling bounds ────────────────────────────────────────
+distance:
+  min_dist_cat: 0
+  max_dist_cat: 20
+action:
+  min_dist_cat: 2
+  max_dist_cat: 10
+close_far_threshold: 10
+
+# ── Trajectory prediction horizon ─────────────────────────────────────────────
+len_traj_pred: 5
+
+# ── Image dimensions ──────────────────────────────────────────────────────────
+image_size: [85, 64]  # [width, height]
+
+# ── Costmap precomputation ────────────────────────────────────────────────────
+precomputed_filename: ../custom_dataset/costmaps.h5
+pl_perturb_ratio: 0.3
+pl_perturb_type: max_val
+mask_crop_ratio: 1.0
+use_mask_grad: False
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+# ep_21909 (train, 94 frames) | ep_9917 (test, 107 frames)
+# Existing pkl: dataset_dist_0_to_20_context_temporal_n1_slack_3.pkl
+datasets:
+  my_custom_dataset:
+    data_folder: ../custom_dataset/
+    train: ../custom_dataset/train/
+    test:  ../custom_dataset/test/
+    end_slack: 3
+    waypoint_spacing: 1
+    goals_per_obs: 1
+    negative_mining: False
+    images_subfolder: images
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+print_log_freq: 10
+image_log_freq: 100
+num_images_log: 4
+pairwise_test_freq: 20
+wandb_log_freq: 5
+eval_freq: 1
+eval_fraction: 1.0

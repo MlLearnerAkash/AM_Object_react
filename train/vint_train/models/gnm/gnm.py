@@ -93,6 +93,11 @@ class GNM(BaseModel):
             self.discrete_action_predictor = nn.Sequential(
                 nn.Linear(32, self.len_trajectory_pred * 4),
             )
+        elif self.kwargs.get("output_vw", False):
+            # Continuous (v, w) regression: linear speed + angular rate per step
+            self.action_predictor = nn.Sequential(
+                nn.Linear(32, self.len_trajectory_pred * 2),
+            )
         else:
             self.action_predictor = nn.Sequential(
                 nn.Linear(32, self.len_trajectory_pred * self.num_action_params),
@@ -146,6 +151,14 @@ class GNM(BaseModel):
             # shape: (B, len_traj_pred, 4) — raw logits, no post-processing
             action_pred = disc_logits.reshape(
                 (disc_logits.shape[0], self.len_trajectory_pred, 4)
+            )
+            return dist_pred, action_pred
+        # --- Continuous (v, w) regression ------------------------------------
+        if self.kwargs.get("output_vw", False):
+            action_pred = self.action_predictor(z)
+            # shape: (B, len_traj_pred, 2)  — [v, w] per step, no cumsum
+            action_pred = action_pred.reshape(
+                (action_pred.shape[0], self.len_trajectory_pred, 2)
             )
             return dist_pred, action_pred
         # --- Continuous waypoint prediction (original behaviour) -------------

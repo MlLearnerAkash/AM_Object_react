@@ -1,0 +1,92 @@
+project_name: object_react_vw
+run_name: object_react_vw
+
+# ── Mode ─────────────────────────────────────────────────────────────────────
+mode: train  # [train, eval]
+
+# ── Input / goal representation (identical to original object_react) ─────────
+goal_type: "image_mask_enc"   # topometric costmap as goal
+obs_type: "disabled"          # no observation image (same as original)
+dims: 8
+goal_uses_context: False
+
+# ── Continuous (v, w) output mode ────────────────────────────────────────────
+# Instead of predicting (dx, dy, dyaw) waypoints, predict (linear_velocity,
+# angular_velocity) = (v, w) per step.
+#   v is normalised by metric_waypoint_spacing * waypoint_spacing  (~1.0 nominal)
+#   w is normalised by pi  (range [-1, 1])
+output_vw: True
+discrete_actions: False
+learn_angle: False        # not applicable: w is regressed directly
+predict_dists: True
+
+# ── Training setup ────────────────────────────────────────────────────────────
+use_wandb: True
+batch_size: 128
+eval_batch_size: 32
+epochs: 30
+gpu_ids: [0]
+num_workers: 8
+eval_num_workers: 4
+lr: 7e-4
+optimizer: adam
+scheduler: null
+seed: 0
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model_type: gnm
+obs_encoding_size: 1024
+goal_encoding_size: 1024
+
+# ── Normalise action labels (recommended) ─────────────────────────────────────
+normalize: True
+
+# ── Context ───────────────────────────────────────────────────────────────────
+context_type: temporal
+context_size: 5
+
+# ── Loss tradeoff ─────────────────────────────────────────────────────────────
+alpha: 0.5
+
+# ── Distance / action sampling bounds ────────────────────────────────────────
+distance:
+  min_dist_cat: 0
+  max_dist_cat: 20
+action:
+  min_dist_cat: 2
+  max_dist_cat: 10
+close_far_threshold: 10
+
+# ── Trajectory prediction horizon ─────────────────────────────────────────────
+# Predict len_traj_pred (v, w) steps; the first step is executed in simulation.
+len_traj_pred: 10
+
+# ── Image dimensions – must match pretrained model ────────────────────────────
+image_size: [85, 64]  # [width, height]
+
+# ── Costmap precomputation ────────────────────────────────────────────────────
+precomputed_filename: ../training/bigger_bot_0.3-sh_0.4/bigger_bot_0.3-sh_0.4_gt_topometric_e3d_masks_pls.h5
+pl_perturb_ratio: 0.3
+pl_perturb_type: max_val
+mask_crop_ratio: 1.0
+use_mask_grad: False
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+datasets:
+  bigger_bot_0.3-sh_0.4:
+    data_folder: ../training/bigger_bot_0.3-sh_0.4/trajectories/
+    train: ../training/bigger_bot_0.3-sh_0.4/train/
+    test:  ../training/bigger_bot_0.3-sh_0.4/test/
+    end_slack: 10
+    goals_per_obs: 2
+    negative_mining: True
+    images_subfolder: images
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+print_log_freq: 100
+image_log_freq: 1000
+num_images_log: 8
+pairwise_test_freq: 20
+wandb_log_freq: 10
+eval_freq: 1
+eval_fraction: 0.25

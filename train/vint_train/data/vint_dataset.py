@@ -124,6 +124,8 @@ class ViNT_Dataset(Dataset):
         self.discrete_actions = self.kwargs.get("discrete_actions", False)
         self.vln_fwd_threshold = self.kwargs.get("vln_fwd_threshold", 0.05)   # metres
         self.vln_turn_threshold = self.kwargs.get("vln_turn_threshold", 0.2)   # radians
+        # Continuous (v, w) regression mode
+        self.output_vw = self.kwargs.get("output_vw", False)
 
         # load data/data_config.yaml
         with open(
@@ -348,6 +350,49 @@ class ViNT_Dataset(Dataset):
 
         return actions, goal_pos
 
+    def _compute_vw_actions(self, traj_data, curr_time, goal_time):
+        """
+        Compute per-step (v, w) labels from consecutive position/yaw samples.
+
+        Returns:
+            vw_actions (np.ndarray): shape (len_traj_pred, 2) with columns [v, w].
+                v = linear speed (normalised by metric_waypoint_spacing * waypoint_spacing).
+                w = angular rate (normalised by pi, so range roughly [-1, 1]).
+            goal_pos (np.ndarray): 2-D goal position in local coords (for vis).
+        """
+        positions = traj_data["position"]  # (N, 2)
+        yaw = traj_data["yaw"]             # (N,)
+        N = len(positions)
+
+        vw_pairs = []
+        for i in range(self.len_traj_pred):
+            t0 = min(curr_time + i * self.waypoint_spacing, N - 2)
+            t1 = min(t0 + self.waypoint_spacing, N - 1)
+            dp = positions[t1] - positions[t0]   # world-frame displacement
+            v = float(np.linalg.norm(dp))
+
+            dy = float(yaw[t1]) - float(yaw[t0])
+            w = float(np.arctan2(np.sin(dy), np.cos(dy)))  # wrap to [-pi, pi]
+            vw_pairs.append([v, w])
+
+        vw_actions = np.array(vw_pairs, dtype=np.float32)  # (T, 2)
+
+        # goal_pos in local frame (same as _compute_actions, for visualisation)
+        goal_idx = min(goal_time, N - 1)
+        goal_pos = to_local_coords(
+            positions[goal_idx], positions[curr_time], float(yaw[curr_time])
+        )
+
+        if self.normalize:
+            metric_scale = (
+                self.data_config["metric_waypoint_spacing"] * self.waypoint_spacing
+            )
+            vw_actions[:, 0] /= metric_scale          # v: ~ 1.0 at nominal speed
+            vw_actions[:, 1] /= np.pi                 # w: range [-1, 1]
+            goal_pos = goal_pos / metric_scale
+
+        return vw_actions, goal_pos
+
     def _load_gt_discrete_actions(self, traj_data, curr_time, goal_time):
         """
         Load ground-truth VLN-CE discrete action labels directly from the
@@ -486,7 +531,12 @@ class ViNT_Dataset(Dataset):
         assert goal_time < goal_traj_len, f"{goal_time} an {goal_traj_len}"
 
         # Compute actions
-        if self.discrete_actions:
+        if self.output_vw:
+            actions, goal_pos = self._compute_vw_actions(
+                curr_traj_data, curr_time, goal_time
+            )
+            actions_torch = torch.as_tensor(actions, dtype=torch.float32)
+        elif self.discrete_actions:
             actions, goal_pos = self._load_gt_discrete_actions(
                 curr_traj_data, curr_time, goal_time
             )

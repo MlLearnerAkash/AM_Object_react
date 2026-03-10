@@ -1645,3 +1645,217 @@ def evaluate_vln(
         action_loss_logger.average(),
         total_loss_logger.average(),
     )
+
+
+# ============================================================================
+# Object-React continuous (v, w) training / evaluation utilities
+# ============================================================================
+
+def train_vw(
+    model: nn.Module,
+    optimizer: Adam,
+    dataloader: DataLoader,
+    transform: transforms,
+    device: torch.device,
+    project_folder: str,
+    normalized: bool,
+    epoch: int,
+    alpha: float = 0.5,
+    print_log_freq: int = 100,
+    wandb_log_freq: int = 10,
+    image_log_freq: int = 1000,
+    num_images_log: int = 8,
+    use_wandb: bool = True,
+    use_tqdm: bool = True,
+    **kwargs,
+):
+    """
+    Train the model for one epoch with continuous (v, w) action labels.
+
+    The model must have been initialised with ``output_vw=True`` so that
+    it returns (dist_pred, action_pred) where action_pred has shape
+    (B, len_traj_pred, 2) — columns are [normalised_v, normalised_w].
+    """
+    predict_dists = kwargs.get("predict_dists", True)
+    goal_type = kwargs.get("goal_type", "image")
+    obs_type = kwargs.get("obs_type", "image")
+
+    model.train()
+    dist_loss_logger = Logger("dist_loss", "train", window_size=print_log_freq)
+    action_loss_logger = Logger("action_loss", "train", window_size=print_log_freq)
+    v_cos_sim_logger = Logger("v_w_cos_sim", "train", window_size=print_log_freq)
+    total_loss_logger = Logger("total_loss", "train", window_size=print_log_freq)
+    loggers = {
+        "dist_loss": dist_loss_logger,
+        "action_loss": action_loss_logger,
+        "v_w_cos_sim": v_cos_sim_logger,
+        "total_loss": total_loss_logger,
+    }
+
+    num_batches = len(dataloader)
+    tqdm_iter = tqdm.tqdm(
+        dataloader,
+        disable=not use_tqdm,
+        dynamic_ncols=True,
+        desc=f"Training V/W epoch {epoch}",
+    )
+    for i, data in enumerate(tqdm_iter):
+        (
+            obs_image,
+            goal_image,
+            action_label,
+            dist_label,
+            goal_pos,
+            dataset_index,
+            action_mask,
+        ) = data
+
+        obs_image, _ = get_obs_image(obs_image, obs_type, transform, device)
+        goal_image, _ = get_goal_image(
+            goal_image, goal_type, transform, device, obs_image
+        )
+
+        dist_pred, action_pred = model(obs_image, goal_image)  # (B,1), (B,T,2)
+
+        if predict_dists:
+            dist_label = dist_label.to(device)
+        action_label = action_label.to(device)   # (B, T, 2)
+        action_mask = action_mask.to(device)
+
+        optimizer.zero_grad()
+
+        losses = _compute_losses(
+            dist_label=dist_label if predict_dists else None,
+            action_label=action_label,
+            dist_pred=dist_pred,
+            action_pred=action_pred,
+            alpha=alpha,
+            learn_angle=False,   # no angle encoding for v/w
+            action_mask=action_mask,
+        )
+
+        losses["total_loss"].backward()
+        optimizer.step()
+
+        # Log cosine similarity on the 2-D (v, w) vector as a quality metric
+        def _masked_cos(pred, label):
+            flat_p = pred.reshape(pred.shape[0], -1)
+            flat_l = label.reshape(label.shape[0], -1)
+            cos = F.cosine_similarity(flat_p, flat_l, dim=-1)
+            return ((cos * action_mask).mean() / (action_mask.mean() + 1e-2)).item()
+
+        loggers["v_w_cos_sim"].log_data(_masked_cos(action_pred, action_label))
+        for key in ["dist_loss", "action_loss", "total_loss"]:
+            loggers[key].log_data(losses[key].item())
+
+        data_log = {}
+        for key, logger in loggers.items():
+            data_log[logger.full_name()] = logger.latest()
+            if i % print_log_freq == 0 and print_log_freq != 0:
+                print(
+                    f"(epoch {epoch}) (batch {i}/{num_batches - 1}) {logger.display()}"
+                )
+
+        if use_wandb and i % wandb_log_freq == 0 and wandb_log_freq != 0:
+            wandb.log(data_log, commit=True)
+
+
+def evaluate_vw(
+    eval_type: str,
+    model: nn.Module,
+    dataloader: DataLoader,
+    transform: transforms,
+    device: torch.device,
+    project_folder: str,
+    normalized: bool,
+    epoch: int = 0,
+    alpha: float = 0.5,
+    num_images_log: int = 8,
+    use_wandb: bool = True,
+    eval_fraction: float = 1.0,
+    use_tqdm: bool = True,
+    **kwargs,
+):
+    """Evaluate the model on the given dataset with continuous (v, w) actions."""
+    predict_dists = kwargs.get("predict_dists", True)
+    goal_type = kwargs.get("goal_type", "image")
+    obs_type = kwargs.get("obs_type", "image")
+
+    model.eval()
+    dist_loss_logger = Logger("dist_loss", eval_type)
+    action_loss_logger = Logger("action_loss", eval_type)
+    v_cos_sim_logger = Logger("v_w_cos_sim", eval_type)
+    total_loss_logger = Logger("total_loss", eval_type)
+    loggers = {
+        "dist_loss": dist_loss_logger,
+        "action_loss": action_loss_logger,
+        "v_w_cos_sim": v_cos_sim_logger,
+        "total_loss": total_loss_logger,
+    }
+
+    num_batches = len(dataloader)
+    num_batches = max(int(num_batches * eval_fraction), 1)
+
+    with torch.no_grad():
+        tqdm_iter = tqdm.tqdm(
+            itertools.islice(dataloader, num_batches),
+            total=num_batches,
+            disable=not use_tqdm,
+            dynamic_ncols=True,
+            desc=f"Evaluating V/W {eval_type} epoch {epoch}",
+        )
+        for i, data in enumerate(tqdm_iter):
+            (
+                obs_image,
+                goal_image,
+                action_label,
+                dist_label,
+                goal_pos,
+                dataset_index,
+                action_mask,
+            ) = data
+
+            obs_image, _ = get_obs_image(obs_image, obs_type, transform, device)
+            goal_image, _ = get_goal_image(
+                goal_image, goal_type, transform, device, obs_image
+            )
+
+            dist_pred, action_pred = model(obs_image, goal_image)
+
+            if predict_dists:
+                dist_label = dist_label.to(device)
+            action_label = action_label.to(device)
+            action_mask = action_mask.to(device)
+
+            losses = _compute_losses(
+                dist_label=dist_label if predict_dists else None,
+                action_label=action_label,
+                dist_pred=dist_pred,
+                action_pred=action_pred,
+                alpha=alpha,
+                learn_angle=False,
+                action_mask=action_mask,
+            )
+
+            def _masked_cos(pred, label):
+                flat_p = pred.reshape(pred.shape[0], -1)
+                flat_l = label.reshape(label.shape[0], -1)
+                cos = F.cosine_similarity(flat_p, flat_l, dim=-1)
+                return ((cos * action_mask).mean() / (action_mask.mean() + 1e-2)).item()
+
+            loggers["v_w_cos_sim"].log_data(_masked_cos(action_pred, action_label))
+            for key in ["dist_loss", "action_loss", "total_loss"]:
+                loggers[key].log_data(losses[key].item())
+
+    data_log = {logger.full_name(): logger.average() for logger in loggers.values()}
+    print(f"[{eval_type} epoch {epoch}] " + " | ".join(
+        f"{k}={v:.4f}" for k, v in data_log.items()
+    ))
+    if use_wandb:
+        wandb.log(data_log, commit=False)
+
+    return (
+        dist_loss_logger.average(),
+        action_loss_logger.average(),
+        total_loss_logger.average(),
+    )

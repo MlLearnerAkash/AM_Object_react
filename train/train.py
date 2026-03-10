@@ -36,6 +36,7 @@ from vint_train.training.train_eval_loop import (
     train_eval_loop,
     train_eval_loop_nomad,
     train_eval_loop_vln,
+    train_eval_loop_vw,
     load_model,
 )
 
@@ -384,6 +385,8 @@ def main(config):
         # Imbalance-mitigation settings
         "vln_class_weights": config.get("vln_class_weights", None),
         "focal_gamma": config.get("focal_gamma", 0.0),
+        # Continuous (v, w) output mode
+        "output_vw": config.get("output_vw", False),
     }
 
     assert config["distance"]["min_dist_cat"] < config["distance"]["max_dist_cat"]
@@ -465,6 +468,28 @@ def main(config):
 
     if kwargs.get("discrete_actions", False):
         train_eval_loop_vln(
+            train_model=config["mode"] == "train",
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            dataloader=train_loader,
+            test_dataloaders=test_dataloaders,
+            transform=transform,
+            epochs=config["epochs"],
+            device=device,
+            project_folder=config["project_folder"],
+            normalized=config["normalize"],
+            print_log_freq=config["print_log_freq"],
+            image_log_freq=config["image_log_freq"],
+            num_images_log=config["num_images_log"],
+            current_epoch=current_epoch,
+            alpha=config["alpha"],
+            use_wandb=config["use_wandb"],
+            eval_fraction=config["eval_fraction"],
+            **kwargs,
+        )
+    elif kwargs.get("output_vw", False):
+        train_eval_loop_vw(
             train_model=config["mode"] == "train",
             model=model,
             optimizer=optimizer,
