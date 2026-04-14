@@ -1351,3 +1351,87 @@ def visualize_diffusion_action_distribution(
         plt.close(fig)
     if len(wandb_list) > 0 and use_wandb:
         wandb.log({f"{eval_type}_action_samples": wandb_list}, commit=False)
+
+
+# ---------------------------------------------------------------------------
+# Joint training — success metric
+# ---------------------------------------------------------------------------
+
+def compute_success_rate(
+    gnm_model: nn.Module,
+    lange3d_model: nn.Module,
+    val_loader,
+    topopaths,
+    device: torch.device,
+    angle_threshold_deg: float = 45.0,
+    max_batches: int = 50,
+) -> float:
+    """
+    Bearing-based success metric for joint (LangGeoNetV2 + GNM) evaluation.
+
+    For each sample that has a visible target (``has_target=True``):
+      - Run LangGeoNetV2 + GNM forward (no grad).
+      - Compare the bearing of the predicted first waypoint [x, y] against
+        the ground-truth bearing derived from the target-object pixel centroid.
+      - A sample is "successful" if the angular error < ``angle_threshold_deg``.
+
+    Returns the fraction of successful samples over the evaluated batches.
+    """
+    gnm_model.eval()
+    lange3d_model.eval()
+
+    angle_threshold = np.deg2rad(angle_threshold_deg)
+    n_success = 0
+    n_total = 0
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(val_loader):
+            if batch_idx >= max_batches:
+                break
+
+            pixel_values = batch["pixel_values"].to(device)
+            nai_input_ids = batch["nai_input_ids"].to(device)
+            nai_attn_mask = batch["nai_attn_mask"].to(device)
+            masks_list    = [m.to(device) for m in batch["masks_list"]]
+            gnm_masks     = batch["gnm_masks"].to(device)
+            K_list        = batch["K_list"]
+            target_bearing = batch["target_bearing"].to(device)   # [B]
+            has_target     = batch["has_target"].to(device)       # [B] bool
+
+            if not has_target.any():
+                continue
+
+            B = pixel_values.shape[0]
+
+            lang_preds, _ = lange3d_model(
+                pixel_values, masks_list, nai_input_ids, nai_attn_mask
+            )
+
+            goal_enc = topopaths.build_differentiable_goal(
+                lang_preds, gnm_masks, K_list, device
+            )  # [B, 3+dims, Hh, Wh]
+            dims = goal_enc.shape[1] - 3
+            _, goal_img = goal_enc.split([3, dims], dim=1)
+
+            obs_img = torch.zeros(B, 3, 120, 160, device=device)
+            _, action_pred = gnm_model(obs_img, goal_img)
+            # action_pred: [B, T, 4] — (x, y, cos_yaw, sin_yaw)
+
+            # Bearing of the first predicted waypoint.
+            first_xy = action_pred[:, 0, :2]                     # [B, 2]
+            pred_bearing = torch.atan2(first_xy[:, 1], first_xy[:, 0])  # [B]
+
+            # Angular error (wrapped to [-π, π]).
+            diff = pred_bearing - target_bearing
+            diff = torch.atan2(torch.sin(diff), torch.cos(diff)).abs()   # [B]
+
+            # Evaluate only on samples with a visible target.
+            valid = has_target.bool()
+            if valid.sum() == 0:
+                continue
+
+            successes = (diff[valid] < angle_threshold).float()
+            n_success += successes.sum().item()
+            n_total   += valid.sum().item()
+
+    return n_success / max(n_total, 1)

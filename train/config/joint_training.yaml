@@ -1,0 +1,116 @@
+# ============================================================
+# Joint LangGeoNetV2 + GNM Training Configuration
+# ============================================================
+
+# --- Run metadata ---
+project_name: joint_lang_gnm
+run_name: joint_run_v1
+use_wandb: true          # set to true and configure wandb before enabling
+wandb_project: joint_lang_gnm
+
+# --- Output ---
+output_dir: ./checkpoints/joint
+
+# --- GPU ---
+gpu_ids: [0]              # list of GPU device IDs; multi-GPU uses DataParallel
+seed: 42
+
+# ============================================================
+# Data
+# ============================================================
+
+# Path to the e3d_train_stratified.h5 (LangE3D training H5 file)
+h5_path: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/e3d_train_stratified.h5
+
+val_split: 0.1            # fraction of episodes held out for validation
+
+# ============================================================
+# Dataset shared parameters
+# ============================================================
+
+len_traj_pred: 10         # number of waypoints T (must match GNM)
+learn_angle: true
+
+action:
+  min_dist_cat: 2         # action loss active only for dist > min
+  max_dist_cat: 10        # action loss active only for dist < max
+
+# ============================================================
+# TopoPaths (differentiable goal builder)
+# ============================================================
+
+dims: 8                   # goal-encoding channels (must match GNM dims kwarg)
+mask_w: 160               # full-res mask width
+mask_h: 120               # full-res mask height; half-res = 60×80 fed to GNM
+
+# ============================================================
+# GNM model
+# ============================================================
+
+model_type: gnm
+goal_type: image_mask_enc
+obs_type: disabled
+context_size: 5
+obs_encoding_size: 1024
+goal_encoding_size: 1024
+use_mask_grad: false
+goal_uses_context: false
+
+# Optional: path to a pre-trained GNM checkpoint.
+# gnm_checkpoint: ./checkpoints/gnm/best.pth
+
+# ============================================================
+# LangGeoNetV2 model
+# ============================================================
+
+d_model: 256
+n_heads: 8
+n_layers: 2
+clip_model: openai/clip-vit-base-patch16
+dino_model: facebook/dinov2-small
+freeze_clip: true         # partially unfreezes last 4 blocks in LangGeoNetV2.__init__
+freeze_dino: true         # partially unfreezes last 2 blocks
+
+# Optional: path to a pre-trained LangGeoNetV2 checkpoint.
+# lange3d_checkpoint: ./lange3dnet_train/checkpoints/best_model.pt
+
+# ============================================================
+# Loss weights
+# ============================================================
+
+# LangGeoNetLoss weights
+lambda_rank: 0.5          # ordinal ranking loss weight
+lambda_si: 0.3            # scale-invariant log loss weight
+
+# Object Grounding Contrastive Loss (OGCL)
+lambda_ogcl: 1.0          # weight of OGCL: enforces pred[referenced class] < pred[others]
+ogcl_margin: 0.3          # margin for directional ranking (same as in train.py)
+
+# Joint loss balance
+lambda_action: 0.01       # weight of GNM loss in total = l_lang + lambda_ogcl*l_ogcl + lambda_action*l_gnm
+
+# GNM internal balance (dist vs action)
+alpha: 0.5                # l_gnm = alpha * l_dist + (1 - alpha) * l_action
+
+# ============================================================
+# Training schedule
+# ============================================================
+
+epochs: 300
+warmup_epochs: 3
+batch_size: 16
+num_workers: 8
+
+# LangGeoNetV2 learning rates (separate head vs backbone)
+lange3d_lr_head: 1.0e-4
+lange3d_lr_backbone: 1.0e-5
+weight_decay: 0.01
+
+# GNM learning rate
+gnm_lr: 7.0e-4
+
+# ============================================================
+# Logging
+# ============================================================
+
+print_log_freq: 100       # print loss every N batches

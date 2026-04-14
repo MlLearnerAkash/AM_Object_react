@@ -110,6 +110,103 @@ class TopoPaths:
             img_enc = np.concatenate([img_enc, grad[None]], axis=0)
         return img_enc, plWtColorImg
 
+    def build_differentiable_goal(
+        self,
+        lang_pred_list: list,
+        gnm_masks: "torch.Tensor",
+        K_list: list,
+        device: "torch.device",
+    ) -> "torch.Tensor":
+        """
+        Build a differentiable goal encoding for the GNM from LangGeoNetV2
+        raw logits, preserving gradient flow.
+
+        Parameters
+        ----------
+        lang_pred_list : list[B] of Tensor[K_b]
+            Raw logits from LangGeoNetV2 (in the computation graph).
+        gnm_masks : Tensor[B, K_max, H//2, W//2] float32
+            Pre-downsampled binary masks (padded with zeros to K_max).
+        K_list : list[B] of int
+            Actual number of objects per sample (unpadded).
+        device : torch.device
+
+        Returns
+        -------
+        goal_enc : Tensor[B, 3 + dims, H//2, W//2]
+            Concatenation of:
+              • channels 0–2 : detached visualisation (cost heat-map overlay)
+              • channels 3– : differentiable goal encoding (grad flows through)
+        """
+        dims = self.rank_enc.shape[1]
+        near_enc = torch.tensor(
+            self.rank_enc[0], dtype=torch.float32, device=device
+        )  # [dims] — low path-length reference vector
+        far_enc = torch.tensor(
+            self.rank_enc[-1], dtype=torch.float32, device=device
+        )  # [dims] — high path-length reference vector
+
+        results = []
+        for b, (logits, K) in enumerate(zip(lang_pred_list, K_list)):
+            masks_b = gnm_masks[b, :K].to(device)   # [K, Hh, Wh]
+            Hh, Wh = masks_b.shape[1], masks_b.shape[2]
+
+            if K == 0:
+                img_enc = torch.zeros(dims, Hh, Wh, device=device)
+                viz = torch.zeros(3, Hh, Wh, device=device)
+                results.append(torch.cat([viz, img_enc], dim=0))
+                continue
+
+            costs = torch.sigmoid(logits)         # [K] ∈ (0,1), in grad graph
+            # Soft blend of near_enc and far_enc per object:
+            #   enc_k = (1 - cost_k) * near_enc + cost_k * far_enc   [K, dims]
+            weights_near = (1.0 - costs).unsqueeze(1)   # [K, 1]
+            weights_far  = costs.unsqueeze(1)            # [K, 1]
+            obj_enc = weights_near * near_enc + weights_far * far_enc  # [K, dims]
+
+            # Accumulate over masks: sum_k mask_k * enc_k → [dims, Hh, Wh]
+            # einsum('kd, khw -> dhw')
+            img_enc = torch.einsum("kd,khw->dhw", obj_enc, masks_b)  # [dims, Hh, Wh]
+
+            # Detached visualisation (winter-like: near=blue, far=red).
+            costs_d = costs.detach()
+            r_ch = (masks_b * costs_d[:, None, None]).sum(0).clamp(0, 1)
+            g_ch = (masks_b * (1.0 - costs_d)[:, None, None]).sum(0).clamp(0, 1)
+            b_ch = torch.zeros_like(r_ch)
+            viz = torch.stack([r_ch, g_ch, b_ch], dim=0).detach()  # [3, Hh, Wh]
+
+            results.append(torch.cat([viz, img_enc], dim=0))  # [3+dims, Hh, Wh]
+
+        return torch.stack(results, dim=0)  # [B, 3+dims, Hh, Wh]
+
+    def create_input_from_predictions(
+        self,
+        pred_logits: "torch.Tensor",
+        masks: "torch.Tensor",
+    ):
+        """
+        Detached wrapper: convert predicted logits + half-res masks to the
+        same ``(img_enc, plWtColorImg)`` tuple as ``create_input()``, for
+        inference / visualisation without gradient tracking.
+
+        Parameters
+        ----------
+        pred_logits : Tensor[K]  raw logits (will be sigmoid'd here)
+        masks       : Tensor[K, H//2, W//2] float32
+
+        Returns
+        -------
+        img_enc      : ndarray [dims, H//2, W//2]
+        plWtColorImg : ndarray [3, H//2, W//2]
+        """
+        costs = torch.sigmoid(pred_logits).detach().cpu().numpy()  # [K]
+        pls_approx = (costs * (self.rank_enc.shape[0] - 1)).astype(int)
+        pls_approx = np.clip(pls_approx, 0, self.rank_enc.shape[0] - 1)
+        masks_np = masks.detach().cpu().numpy()  # [K, Hh, Wh]
+        # Call existing create_input with preconverted masks.
+        # pls_approx passed directly (already int indices).
+        return self.create_input(pls_approx, masks_np, convertMask=False)
+
 
 def normalize_pls(pls, scale_factor=100, outlier_value=99, new_max_val=None):
 

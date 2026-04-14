@@ -324,3 +324,312 @@ def count_parameters(model):
     # print(table)
     print(f"Total Trainable Params: {total_params/1e6:.2f}M")
     return total_params
+
+
+# ---------------------------------------------------------------------------
+# Joint LangGeoNetV2 + GNM training loop
+# ---------------------------------------------------------------------------
+
+def train_eval_loop_joint(
+    lange3d_model: nn.Module,
+    gnm_model: nn.Module,
+    lange3d_optimizer: torch.optim.Optimizer,
+    gnm_optimizer: torch.optim.Optimizer,
+    lange3d_scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
+    gnm_scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    topopaths,                              # TopoPaths instance
+    lange3d_loss_fn: nn.Module,            # LangGeoNetLoss
+    epochs: int,
+    device: torch.device,
+    lambda_action: float = 0.01,
+    alpha_dist: float = 0.5,
+    log_freq: int = 100,
+    save_dir: str = "checkpoints",
+    project_name: str = "joint_training",
+    ogcl_criterion: nn.Module = None,      # ObjectGroundingContrastiveLoss
+    lambda_ogcl: float = 1.0,
+):
+    """
+    End-to-end joint training of LangGeoNetV2 and GNM.
+
+    LangGeoNetV2 predicts per-object costs from language + RGB;
+    those costs are differentiably composed into a goal encoding that
+    drives GNM action prediction (replaces pre-computed H5 costmaps).
+
+    Loss:
+        total = l_lang + lambda_ogcl * l_ogcl + lambda_action * l_gnm
+
+    ogcl_criterion: ObjectGroundingContrastiveLoss — enforces that objects of
+        the referenced category receive lower predicted costs than unmatched
+        objects (directional margin ranking on raw logits).
+    """
+    from vint_train.training.train_utils import compute_success_rate
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    best_val_loss = float("inf")
+
+    for epoch in range(1, epochs + 1):
+        # ------------------------------------------------------------------
+        # Training
+        # ------------------------------------------------------------------
+        lange3d_model.train()
+        gnm_model.train()
+
+        running_loss_total = 0.0
+        running_loss_lang  = 0.0
+        running_loss_gnm   = 0.0
+        running_loss_ogcl  = 0.0
+        n_batches = 0
+
+        for batch_idx, batch in enumerate(train_loader):
+            pixel_values = batch["pixel_values"].to(device)     # [B, 3, 224, 224]
+            nai_input_ids = batch["nai_input_ids"].to(device)   # [B, 77]
+            nai_attn_mask = batch["nai_attn_mask"].to(device)   # [B, 77]
+            masks_list    = [m.to(device) for m in batch["masks_list"]]
+            gt_costs_list = [c.to(device) for c in batch["gt_costs_list"]]
+            class_match_list = batch["class_match_list"]
+            gnm_masks     = batch["gnm_masks"].to(device)       # [B, K_max, Hh, Wh]
+            K_list        = batch["K_list"]
+            action_label  = batch["action_label"].to(device)    # [B, T, 4]
+            dist_label    = batch["dist_label"].to(device)      # [B]
+            action_mask   = batch["action_mask"].to(device)     # [B]
+
+            B = pixel_values.shape[0]
+
+            lange3d_optimizer.zero_grad()
+            gnm_optimizer.zero_grad()
+
+            # ---- LangGeoNetV2 forward ------------------------------------
+            # Signature: forward(images, masks_list, input_ids, attention_mask)
+            # Returns: (list[B of [K_b] raw logits], attn_weights_all)
+            lang_preds, _ = lange3d_model(
+                pixel_values, masks_list, nai_input_ids, nai_attn_mask
+            )
+
+            # ---- LangGeoNet loss — returns (loss_tensor, loss_dict) ------
+            l_lang, _ = lange3d_loss_fn(lang_preds, gt_costs_list)
+
+            # ---- Object Grounding Contrastive Loss -----------------------
+            # Enforces: pred[referenced class] < pred[other objects] + margin
+            l_ogcl = torch.tensor(0.0, device=device)
+            if ogcl_criterion is not None and class_match_list:
+                class_match_dev = [m.to(device) for m in class_match_list]
+                l_ogcl = ogcl_criterion(lang_preds, class_match_dev)
+
+            # ---- Build differentiable goal encoding ----------------------
+            goal_enc = topopaths.build_differentiable_goal(
+                lang_preds, gnm_masks, K_list, device
+            )  # [B, 3+dims, Hh, Wh]
+
+            # Split: first 3 = viz (detached), rest = differentiable enc.
+            dims = goal_enc.shape[1] - 3
+            _, goal_img = goal_enc.split([3, dims], dim=1)  # [B, dims, Hh, Wh]
+
+            # ---- GNM forward (obs disabled → zeros) ----------------------
+            obs_img = torch.zeros(B, 3, 120, 160, device=device)
+            dist_pred, action_pred = gnm_model(obs_img, goal_img)
+            # dist_pred:   [B, 1]
+            # action_pred: [B, T, 4]
+
+            # ---- GNM loss ------------------------------------------------
+            dist_label_f = dist_label.float().unsqueeze(1)  # [B, 1]
+            l_dist = F.mse_loss(dist_pred, dist_label_f)
+
+            # Action loss — weighted by action_mask (only active steps).
+            action_diff = (action_pred - action_label) ** 2          # [B, T, 4]
+            l_action = (action_diff.mean(-1).mean(-1) * action_mask).sum()
+            if action_mask.sum() > 0:
+                l_action = l_action / action_mask.sum()
+
+            l_gnm = alpha_dist * l_dist + (1.0 - alpha_dist) * l_action
+
+            # ---- Combined loss & backward --------------------------------
+            total_loss = l_lang + lambda_ogcl * l_ogcl + lambda_action * l_gnm
+            total_loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(lange3d_model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(gnm_model.parameters(), 1.0)
+
+            lange3d_optimizer.step()
+            gnm_optimizer.step()
+
+            running_loss_total += total_loss.item()
+            running_loss_lang  += l_lang.item()
+            running_loss_gnm   += l_gnm.item()
+            running_loss_ogcl  += l_ogcl.item()
+            n_batches += 1
+
+            if (batch_idx + 1) % log_freq == 0:
+                avg_total = running_loss_total / n_batches
+                avg_lang  = running_loss_lang  / n_batches
+                avg_gnm   = running_loss_gnm   / n_batches
+                avg_ogcl  = running_loss_ogcl  / n_batches
+                print(
+                    f"  Epoch {epoch} | step {batch_idx+1}"
+                    f" | total={avg_total:.4f}"
+                    f"  lang={avg_lang:.4f}  ogcl={avg_ogcl:.4f}  gnm={avg_gnm:.4f}"
+                )
+                wandb.log({
+                    "train/loss_total": avg_total,
+                    "train/loss_lang":  avg_lang,
+                    "train/loss_ogcl":  avg_ogcl,
+                    "train/loss_gnm":   avg_gnm,
+                    "epoch": epoch,
+                })
+                running_loss_total = running_loss_lang = running_loss_gnm = running_loss_ogcl = 0.0
+                n_batches = 0
+
+        # LR schedulers
+        if lange3d_scheduler is not None:
+            lange3d_scheduler.step()
+        if gnm_scheduler is not None:
+            gnm_scheduler.step()
+
+        # ------------------------------------------------------------------
+        # Validation
+        # ------------------------------------------------------------------
+        lange3d_model.eval()
+        gnm_model.eval()
+
+        val_loss_total = 0.0
+        val_loss_lang  = 0.0
+        val_loss_ogcl  = 0.0
+        val_loss_gnm   = 0.0
+        val_n = 0
+
+        viz_samples: list = []   # collect first few samples for canvas logging
+        viz_done    = False
+
+        with torch.no_grad():
+            for batch in val_loader:
+                pixel_values = batch["pixel_values"].to(device)
+                nai_input_ids = batch["nai_input_ids"].to(device)
+                nai_attn_mask = batch["nai_attn_mask"].to(device)
+                masks_list    = [m.to(device) for m in batch["masks_list"]]
+                gt_costs_list = [c.to(device) for c in batch["gt_costs_list"]]
+                gnm_masks     = batch["gnm_masks"].to(device)
+                K_list        = batch["K_list"]
+                action_label  = batch["action_label"].to(device)
+                action_mask   = batch["action_mask"].to(device)
+                dist_label    = batch["dist_label"].to(device)
+
+                lang_preds, _ = lange3d_model(
+                    pixel_values, masks_list, nai_input_ids, nai_attn_mask
+                )
+                l_lang, _ = lange3d_loss_fn(lang_preds, gt_costs_list)
+
+                # OGCL on val set (for monitoring collapse)
+                l_ogcl_v = torch.tensor(0.0, device=device)
+                if ogcl_criterion is not None and batch.get("class_match_list"):
+                    cm_dev   = [m.to(device) for m in batch["class_match_list"]]
+                    l_ogcl_v = ogcl_criterion(lang_preds, cm_dev)
+
+                goal_enc = topopaths.build_differentiable_goal(
+                    lang_preds, gnm_masks, K_list, device
+                )
+                dims = goal_enc.shape[1] - 3
+                _, goal_img = goal_enc.split([3, dims], dim=1)
+
+                B = pixel_values.shape[0]
+                obs_img = torch.zeros(B, 3, 120, 160, device=device)
+                dist_pred, action_pred = gnm_model(obs_img, goal_img)
+
+                dist_label_f = dist_label.float().unsqueeze(1)
+                l_dist   = F.mse_loss(dist_pred, dist_label_f)
+                a_diff   = (action_pred - action_label) ** 2
+                l_action_v = (a_diff.mean(-1).mean(-1) * action_mask).sum()
+                if action_mask.sum() > 0:
+                    l_action_v = l_action_v / action_mask.sum()
+
+                l_gnm_v = alpha_dist * l_dist + (1.0 - alpha_dist) * l_action_v
+                total_v = l_lang + lambda_ogcl * l_ogcl_v + lambda_action * l_gnm_v
+
+                val_loss_total += total_v.item()
+                val_loss_lang  += l_lang.item()
+                val_loss_ogcl  += l_ogcl_v.item()
+                val_loss_gnm   += l_gnm_v.item()
+                val_n += 1
+
+                # Collect viz samples from the first validation batch only.
+                if not viz_done:
+                    pv_cpu = pixel_values.cpu()
+                    ap_cpu = action_pred.cpu()
+                    for b in range(min(4, B)):
+                        viz_samples.append({
+                            "pixel_values": pv_cpu[b],
+                            # masks_list[b] lives on device; batch["masks_list"][b] is CPU
+                            "masks":        batch["masks_list"][b],
+                            "gt_costs":     gt_costs_list[b].cpu(),
+                            "pred_costs":   torch.sigmoid(lang_preds[b]).cpu(),
+                            "gt_action":    batch["action_label"][b],    # CPU
+                            "pred_action":  ap_cpu[b],
+                        })
+                    viz_done = True
+
+        avg_val      = val_loss_total / max(val_n, 1)
+        avg_val_lang = val_loss_lang  / max(val_n, 1)
+        avg_val_ogcl = val_loss_ogcl  / max(val_n, 1)
+        avg_val_gnm  = val_loss_gnm   / max(val_n, 1)
+
+        success_rate = compute_success_rate(
+            gnm_model, lange3d_model, val_loader, topopaths, device,
+            max_batches=20,
+        )
+        print(
+            f"Epoch {epoch} | val_loss={avg_val:.4f}"
+            f"  lang={avg_val_lang:.4f}  ogcl={avg_val_ogcl:.4f}"
+            f"  gnm={avg_val_gnm:.4f}  success={success_rate:.3f}"
+        )
+
+        # ---- Build visualisation canvases --------------------------------
+        canvas_imgs = []
+        try:
+            from vis_utils.cost_overlay import make_joint_val_canvas
+            for idx, s in enumerate(viz_samples):
+                canvas = make_joint_val_canvas(
+                    s["pixel_values"], s["masks"],
+                    s["gt_costs"], s["pred_costs"],
+                    s["gt_action"], s["pred_action"],
+                )
+                canvas_imgs.append(
+                    wandb.Image(canvas, caption=f"ep{epoch}_s{idx}")
+                )
+        except Exception as exc:
+            print(f"[viz] canvas generation failed: {exc}")
+
+        log_dict = {
+            "val/loss_total":   avg_val,
+            "val/loss_lang":    avg_val_lang,
+            "val/loss_ogcl":    avg_val_ogcl,
+            "val/loss_gnm":     avg_val_gnm,
+            "val/success_rate": success_rate,
+            "epoch": epoch,
+        }
+        if canvas_imgs:
+            log_dict["val/viz"] = canvas_imgs
+        wandb.log(log_dict)
+
+        # Save checkpoint
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
+            torch.save({
+                "epoch":            epoch,
+                "lange3d":          lange3d_model.state_dict(),
+                "gnm":              gnm_model.state_dict(),
+                "lange3d_opt":      lange3d_optimizer.state_dict(),
+                "gnm_opt":          gnm_optimizer.state_dict(),
+                "val_loss":         avg_val,
+            }, os.path.join(save_dir, "best_joint.pth"))
+            print(f"  → best checkpoint saved (val_loss={avg_val:.4f})")
+
+        torch.save({
+            "epoch":        epoch,
+            "lange3d":      lange3d_model.state_dict(),
+            "gnm":          gnm_model.state_dict(),
+            "val_loss":     avg_val,
+        }, os.path.join(save_dir, f"latest.pth"))
+
+    print("[train_eval_loop_joint] Done.")
