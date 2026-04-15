@@ -1354,8 +1354,23 @@ def visualize_diffusion_action_distribution(
 
 
 # ---------------------------------------------------------------------------
-# Joint training — success metric
+# Joint training — success metric and nDTW
 # ---------------------------------------------------------------------------
+
+def _dtw_distance(pred_xy: np.ndarray, gt_xy: np.ndarray) -> float:
+    """
+    Compute Dynamic Time Warping distance between two [T, 2] XY trajectory
+    arrays using Euclidean step cost.  O(T^2) — fine for T=10.
+    """
+    T1, T2 = len(pred_xy), len(gt_xy)
+    D = np.full((T1 + 1, T2 + 1), np.inf)
+    D[0, 0] = 0.0
+    for i in range(1, T1 + 1):
+        for j in range(1, T2 + 1):
+            cost = np.linalg.norm(pred_xy[i - 1] - gt_xy[j - 1])
+            D[i, j] = cost + min(D[i - 1, j], D[i, j - 1], D[i - 1, j - 1])
+    return float(D[T1, T2])
+
 
 def compute_success_rate(
     gnm_model: nn.Module,
@@ -1363,42 +1378,54 @@ def compute_success_rate(
     val_loader,
     topopaths,
     device: torch.device,
-    angle_threshold_deg: float = 45.0,
+    success_radius_m: float = 1.0,
     max_batches: int = 50,
-) -> float:
+) -> dict:
     """
-    Bearing-based success metric for joint (LangGeoNetV2 + GNM) evaluation.
+    Computes two metrics for joint (LangGeoNetV2 + GNM) evaluation:
 
-    For each sample that has a visible target (``has_target=True``):
-      - Run LangGeoNetV2 + GNM forward (no grad).
-      - Compare the bearing of the predicted first waypoint [x, y] against
-        the ground-truth bearing derived from the target-object pixel centroid.
-      - A sample is "successful" if the angular error < ``angle_threshold_deg``.
+    success_rate
+        Fraction of samples where the predicted **last waypoint** falls
+        within ``success_radius_m`` metres of the GT last waypoint in the
+        agent-local XZ frame.  The GT last waypoint equals the OBB centre
+        of the min-cost object (= navigation target) interpolated to 1.0 α
+        in local coords.
 
-    Returns the fraction of successful samples over the evaluated batches.
+    nDTW
+        Mean normalised Dynamic Time Warping between the predicted XY
+        trajectory and the GT interpolated trajectory::
+
+            nDTW_i = exp(-DTW(pred_i, gt_i) / (T × success_radius_m))
+
+        Averaged over all valid samples (``action_mask == 1``).
+
+    Only samples with ``action_mask == 1.0`` contribute to both metrics.
+    Returns a dict with keys ``"success_rate"`` and ``"nDTW"``.
     """
     gnm_model.eval()
     lange3d_model.eval()
 
-    angle_threshold = np.deg2rad(angle_threshold_deg)
-    n_success = 0
-    n_total = 0
+    n_success  = 0
+    n_total    = 0
+    ndtw_sum   = 0.0
+    ndtw_count = 0
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_loader):
             if batch_idx >= max_batches:
                 break
 
-            pixel_values = batch["pixel_values"].to(device)
+            pixel_values  = batch["pixel_values"].to(device)
             nai_input_ids = batch["nai_input_ids"].to(device)
             nai_attn_mask = batch["nai_attn_mask"].to(device)
             masks_list    = [m.to(device) for m in batch["masks_list"]]
             gnm_masks     = batch["gnm_masks"].to(device)
             K_list        = batch["K_list"]
-            target_bearing = batch["target_bearing"].to(device)   # [B]
-            has_target     = batch["has_target"].to(device)       # [B] bool
+            action_label  = batch["action_label"].to(device)  # [B, T, 4]
+            action_mask   = batch["action_mask"].to(device)   # [B]
 
-            if not has_target.any():
+            valid = action_mask.bool()
+            if not valid.any():
                 continue
 
             B = pixel_values.shape[0]
@@ -1415,23 +1442,31 @@ def compute_success_rate(
 
             obs_img = torch.zeros(B, 3, 120, 160, device=device)
             _, action_pred = gnm_model(obs_img, goal_img)
-            # action_pred: [B, T, 4] — (x, y, cos_yaw, sin_yaw)
+            # action_pred: [B, T, 4] — (x_local, z_local, cos_dyaw, sin_dyaw)
 
-            # Bearing of the first predicted waypoint.
-            first_xy = action_pred[:, 0, :2]                     # [B, 2]
-            pred_bearing = torch.atan2(first_xy[:, 1], first_xy[:, 0])  # [B]
+            # --- Success: last predicted waypoint within radius of GT ------
+            pred_last = action_pred[:, -1, :2]   # [B, 2]
+            gt_last   = action_label[:, -1, :2]  # [B, 2]
+            dist_last = torch.norm(pred_last - gt_last, dim=-1)  # [B]
 
-            # Angular error (wrapped to [-π, π]).
-            diff = pred_bearing - target_bearing
-            diff = torch.atan2(torch.sin(diff), torch.cos(diff)).abs()   # [B]
+            successes  = (dist_last[valid] < success_radius_m).float()
+            n_success += int(successes.sum().item())
+            n_total   += int(valid.sum().item())
 
-            # Evaluate only on samples with a visible target.
-            valid = has_target.bool()
-            if valid.sum() == 0:
-                continue
+            # --- nDTW per sample ------------------------------------------
+            pred_xy  = action_pred[:, :, :2].cpu().numpy()   # [B, T, 2]
+            gt_xy    = action_label[:, :, :2].cpu().numpy()  # [B, T, 2]
+            valid_np = valid.cpu().numpy()                   # [B] bool
+            T        = pred_xy.shape[1]
 
-            successes = (diff[valid] < angle_threshold).float()
-            n_success += successes.sum().item()
-            n_total   += valid.sum().item()
+            for b in range(B):
+                if not valid_np[b]:
+                    continue
+                dtw = _dtw_distance(pred_xy[b], gt_xy[b])
+                ndtw_sum   += float(np.exp(-dtw / (T * success_radius_m)))
+                ndtw_count += 1
 
-    return n_success / max(n_total, 1)
+    return {
+        "success_rate": n_success / max(n_total, 1),
+        "nDTW":         ndtw_sum  / max(ndtw_count, 1),
+    }

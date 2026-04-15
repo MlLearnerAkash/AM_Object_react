@@ -574,14 +574,16 @@ def train_eval_loop_joint(
         avg_val_ogcl = val_loss_ogcl  / max(val_n, 1)
         avg_val_gnm  = val_loss_gnm   / max(val_n, 1)
 
-        success_rate = compute_success_rate(
+        success_metrics = compute_success_rate(
             gnm_model, lange3d_model, val_loader, topopaths, device,
             max_batches=20,
         )
+        success_rate = success_metrics["success_rate"]
+        ndtw         = success_metrics["nDTW"]
         print(
             f"Epoch {epoch} | val_loss={avg_val:.4f}"
             f"  lang={avg_val_lang:.4f}  ogcl={avg_val_ogcl:.4f}"
-            f"  gnm={avg_val_gnm:.4f}  success={success_rate:.3f}"
+            f"  gnm={avg_val_gnm:.4f}  success={success_rate:.3f}  nDTW={ndtw:.3f}"
         )
 
         # ---- Build visualisation canvases --------------------------------
@@ -606,6 +608,7 @@ def train_eval_loop_joint(
             "val/loss_ogcl":    avg_val_ogcl,
             "val/loss_gnm":     avg_val_gnm,
             "val/success_rate": success_rate,
+            "val/nDTW":         ndtw,
             "epoch": epoch,
         }
         if canvas_imgs:

@@ -67,11 +67,17 @@ def _install_mock_magnum() -> None:
         def __init__(self, *args, **kwargs):
             pass
         def __setstate__(self, state):
-            # Magnum types store themselves as raw bytes; ignore the payload.
+            # Magnum types serialise as raw bytes of their underlying data.
             self._state = state
 
+    class _Vector3(_MagnumBase):
+        """Decodable stub: exposes the 3 float32 components as a numpy array."""
+        def as_array(self) -> np.ndarray:
+            return np.frombuffer(self._state, dtype=np.float32).astype(np.float64)
+
     mod = types.ModuleType("_magnum")
-    for _name in ("Vector3", "Vector4", "Matrix4", "Matrix3", "Quaternion",
+    mod.Vector3 = _Vector3
+    for _name in ("Vector4", "Matrix4", "Matrix3", "Quaternion",
                   "Rad", "Deg", "Range3D", "Range2D"):
         setattr(mod, _name, type(_name, (_MagnumBase,), {}))
     sys.modules["_magnum"] = mod
@@ -156,12 +162,13 @@ def _extract_graph_frame_data(G, h5_frame_keys: list[str]) -> dict:
     Given a loaded NetworkX graph *G* and the set of H5 frame keys present
     for an episode, return a dict mapping
 
-        frame_key → (raw_costs, cat_names, agent_pos, agent_rot)
+        frame_key → (raw_costs, cat_names, agent_pos, agent_rot, obb_centers)
 
-    raw_costs  : [K] float64   — min Dijkstra path length to goal frame.
-    cat_names  : [K] str       — MP3D category name per node, in map[1] order.
-    agent_pos  : [3] float64   — agent position in world frame for this step.
-    agent_rot  : [3,3] float64 — agent-to-world rotation matrix for this step.
+    raw_costs  : [K] float64      — min Dijkstra path length to goal frame.
+    cat_names  : [K] str          — MP3D category name per node, in map[1] order.
+    agent_pos  : [3] float64      — agent position in world frame for this step.
+    agent_rot  : [3,3] float64    — agent-to-world rotation matrix for this step.
+    obb_centers: list[K] float64  — world-space OBB centre for each object.
 
     Only frame keys that appear in *h5_frame_keys* are included.
     """
@@ -215,7 +222,16 @@ def _extract_graph_frame_data(G, h5_frame_keys: list[str]) -> dict:
         agent_rot = np.asarray(G.nodes[src_nodes[0]]["agent_rotation"],
                                dtype=np.float64)
 
-        result[frame_key] = (raw_costs, cat_names, agent_pos, agent_rot)
+        # obb_center world positions — decoded from the _Vector3 stub.
+        obb_centers = []
+        for n in src_nodes:
+            obb = G.nodes[n].get("instance_dict", {}).get("obb_center")
+            if obb is not None and hasattr(obb, "as_array"):
+                obb_centers.append(obb.as_array())   # [3] float64
+            else:
+                obb_centers.append(agent_pos.copy()) # fallback: agent pos
+
+        result[frame_key] = (raw_costs, cat_names, agent_pos, agent_rot, obb_centers)
 
     return result
 
@@ -335,37 +351,35 @@ class JointEpisodeDataset(Dataset):
                     and "masks" in ep_grp["frames"][fk]
                     and len(frame_data[fk][0]) > 0
                 ]
-                # Each entry: (frame_key, agent_pos, agent_rot)
-                ep_seq = [
-                    (fk, frame_data[fk][2], frame_data[fk][3])
-                    for fk in valid_keys
-                ]
-
                 T = self.len_traj_pred
 
                 for seq_idx, frame_key in enumerate(valid_keys):
-                    raw_costs, cat_names, curr_pos, curr_rot = frame_data[frame_key]
+                    raw_costs, cat_names, curr_pos, curr_rot, obb_centers = frame_data[frame_key]
                     K = len(raw_costs)
 
-                    # Collect next T frames' poses for waypoints.
-                    future = ep_seq[seq_idx + 1 : seq_idx + 1 + T]
-                    n_future = len(future)
+                    # ---- Action label: interpolate to min-cost object --------
+                    # Find the object with the smallest raw path-length cost.
+                    finite_mask = np.isfinite(raw_costs)
+                    if finite_mask.any():
+                        best_k  = int(np.argmin(
+                            np.where(finite_mask, raw_costs, np.inf)
+                        ))
+                        target_world = obb_centers[best_k]   # [3] world XYZ
 
-                    action_label = np.zeros((T, 4), dtype=np.float32)
-                    if n_future > 0:
-                        curr_yaw = _yaw_from_rotmat(curr_rot)
-                        for t, (_, fut_pos, fut_rot) in enumerate(future):
-                            xy    = _to_local_coords_2d(fut_pos, curr_pos, curr_rot)
-                            dyaw  = _yaw_from_rotmat(fut_rot) - curr_yaw
-                            action_label[t] = [xy[0], xy[1],
-                                               np.cos(dyaw), np.sin(dyaw)]
-                        # Pad remaining steps with last known waypoint.
-                        for t in range(n_future, T):
-                            action_label[t] = action_label[n_future - 1]
+                        # Interpolate T+1 points from agent→target, drop t=0.
+                        alphas = np.linspace(0.0, 1.0, T + 1)[1:]  # (0,1] exclusive start
+                        action_label = np.zeros((T, 4), dtype=np.float32)
+                        for t, a in enumerate(alphas):
+                            wp_world = curr_pos + a * (target_world - curr_pos)
+                            xy   = _to_local_coords_2d(wp_world, curr_pos, curr_rot)
+                            # No yaw change — heading toward target is implicit in XY.
+                            action_label[t] = [xy[0], xy[1], 1.0, 0.0]  # cos=1, sin=0
+                        action_mask = 1.0
+                    else:
+                        action_label = np.zeros((T, 4), dtype=np.float32)
+                        action_mask  = 0.0
 
-                    action_mask = 1.0 if n_future > 0 else 0.0
-
-                    # dist_label: step distance to goal = number of remaining frames.
+                    # dist_label: remaining H5 frames to goal.
                     dist_label = len(valid_keys) - 1 - seq_idx
 
                     self.frames.append({
@@ -376,7 +390,7 @@ class JointEpisodeDataset(Dataset):
                         "raw_costs":    raw_costs,     # [K] float64
                         "cat_names":    cat_names,     # [K] str
                         "action_label": action_label,  # [T, 4] float32
-                        "action_mask":  action_mask,   # float
+                        "action_mask":  float(action_mask),
                         "dist_label":   dist_label,    # int
                     })
                     n_frames += 1
