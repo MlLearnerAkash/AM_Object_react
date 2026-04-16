@@ -96,6 +96,7 @@ def make_joint_val_canvas(
     pred_costs,     # [K] float32 tensor (CPU), already sigmoid → [0,1]
     gt_action,      # [T, 4] float32 tensor (CPU) — local robot frame
     pred_action,    # [T, 4] float32 tensor (CPU) — local robot frame
+    nai_text: str = "",   # next-action instruction to display
     alpha: float = 0.5,
 ) -> np.ndarray:
     """
@@ -122,18 +123,19 @@ def make_joint_val_canvas(
     gt_ov = _cost_overlay(rgb, masks_np, gt_c, alpha)
     pr_ov = _cost_overlay(rgb, masks_np, pr_c, alpha)
 
-    fig = plt.figure(figsize=(18, 5))
-    gs  = fig.add_gridspec(1, 3, wspace=0.08)
+    fig = plt.figure(figsize=(18, 6))
+    gs  = fig.add_gridspec(2, 3, wspace=0.08, hspace=0.15,
+                           height_ratios=[1, 0.08])
 
     # ---- Panel 1: GT cost overlay ----------------------------------------
-    ax0 = fig.add_subplot(gs[0])
+    ax0 = fig.add_subplot(gs[0, 0])
     ax0.imshow(gt_ov)
     _annotate_costs(ax0, masks_np, gt_c)
     ax0.set_title("GT cost", fontsize=11, fontweight="bold")
     ax0.axis("off")
 
     # ---- Panel 2: Predicted cost overlay ---------------------------------
-    ax1 = fig.add_subplot(gs[1])
+    ax1 = fig.add_subplot(gs[0, 1])
     ax1.imshow(pr_ov)
     _annotate_costs(ax1, masks_np, pr_c)
     ax1.set_title("Pred cost", fontsize=11, fontweight="bold")
@@ -141,11 +143,11 @@ def make_joint_val_canvas(
 
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=mcolors.Normalize(0, 1))
     sm.set_array([])
-    fig.colorbar(sm, ax=[ax0, ax1], fraction=0.025, pad=0.02,
+    fig.colorbar(sm, ax=ax0, fraction=0.025, pad=0.02,
                  label="cost  (0 = low/green   1 = high/red)")
 
     # ---- Panel 3: Top-down trajectory ------------------------------------
-    ax2 = fig.add_subplot(gs[2])
+    ax2 = fig.add_subplot(gs[0, 2])
     # Robot frame: x = forward (plotted on Y-axis), y = left (X-axis)
     gt_x,   gt_y   = gt_wp[:, 0],   gt_wp[:, 1]
     pred_x, pred_y = pred_wp[:, 0], pred_wp[:, 1]
@@ -167,6 +169,19 @@ def make_joint_val_canvas(
     ax2.legend(fontsize=8, loc="upper right")
     ax2.set_aspect("equal")
     ax2.grid(True, ls=":", alpha=0.4)
+
+    # ---- Instruction text row (spans all 3 columns) ---------------------
+    if nai_text:
+        ax_txt = fig.add_subplot(gs[1, :])
+        ax_txt.axis("off")
+        # Wrap long instructions so they fit within the canvas width.
+        import textwrap
+        wrapped = textwrap.fill(nai_text, width=120)
+        ax_txt.text(0.5, 0.5, wrapped,
+                    ha="center", va="center",
+                    fontsize=20, color="black", fontweight="normal",
+                    transform=ax_txt.transAxes,
+                    wrap=True)
 
     fig.tight_layout()
     fig.canvas.draw()

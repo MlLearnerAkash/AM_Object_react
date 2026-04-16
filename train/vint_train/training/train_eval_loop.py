@@ -350,6 +350,7 @@ def train_eval_loop_joint(
     project_name: str = "joint_training",
     ogcl_criterion: nn.Module = None,      # ObjectGroundingContrastiveLoss
     lambda_ogcl: float = 1.0,
+    lambda_aux: float = 0.001,             # cross-module skip-connection weight
 ):
     """
     End-to-end joint training of LangGeoNetV2 and GNM.
@@ -394,6 +395,7 @@ def train_eval_loop_joint(
             gnm_masks     = batch["gnm_masks"].to(device)       # [B, K_max, Hh, Wh]
             K_list        = batch["K_list"]
             action_label  = batch["action_label"].to(device)    # [B, T, 4]
+            wp_mask       = batch["wp_mask"].to(device)           # [B, T] — 1 while moving
             dist_label    = batch["dist_label"].to(device)      # [B]
             action_mask   = batch["action_mask"].to(device)     # [B]
 
@@ -403,56 +405,48 @@ def train_eval_loop_joint(
             gnm_optimizer.zero_grad()
 
             # ---- LangGeoNetV2 forward ------------------------------------
-            # Signature: forward(images, masks_list, input_ids, attention_mask)
-            # Returns: (list[B of [K_b] raw logits], attn_weights_all)
             lang_preds, _ = lange3d_model(
                 pixel_values, masks_list, nai_input_ids, nai_attn_mask
             )
 
-            # ---- LangGeoNet loss — returns (loss_tensor, loss_dict) ------
+            # ---- Losses --------------------------------------------------
             l_lang, _ = lange3d_loss_fn(lang_preds, gt_costs_list)
 
-            # ---- Object Grounding Contrastive Loss -----------------------
-            # Enforces: pred[referenced class] < pred[other objects] + margin
             l_ogcl = torch.tensor(0.0, device=device)
             if ogcl_criterion is not None and class_match_list:
                 class_match_dev = [m.to(device) for m in class_match_list]
                 l_ogcl = ogcl_criterion(lang_preds, class_match_dev)
 
-            # ---- Build differentiable goal encoding ----------------------
+            l_lange3d = l_lang + lambda_ogcl * l_ogcl
+
+            # Keeps the gradient path: l_gnm → goal_enc → lang_preds → lange3d_model
             goal_enc = topopaths.build_differentiable_goal(
                 lang_preds, gnm_masks, K_list, device
-            )  # [B, 3+dims, Hh, Wh]
+            )
+            _, goal_img = goal_enc.split([3, goal_enc.shape[1] - 3], dim=1)
 
-            # Split: first 3 = viz (detached), rest = differentiable enc.
-            dims = goal_enc.shape[1] - 3
-            _, goal_img = goal_enc.split([3, dims], dim=1)  # [B, dims, Hh, Wh]
-
-            # ---- GNM forward (obs disabled → zeros) ----------------------
             obs_img = torch.zeros(B, 3, 120, 160, device=device)
             dist_pred, action_pred = gnm_model(obs_img, goal_img)
-            # dist_pred:   [B, 1]
-            # action_pred: [B, T, 4]
 
-            # ---- GNM loss ------------------------------------------------
-            dist_label_f = dist_label.float().unsqueeze(1)  # [B, 1]
-            l_dist = F.mse_loss(dist_pred, dist_label_f)
+            l_dist = F.mse_loss(dist_pred, dist_label.float().unsqueeze(1))
 
-            # Action loss — weighted by action_mask (only active steps).
-            action_diff = (action_pred - action_label) ** 2          # [B, T, 4]
-            l_action = (action_diff.mean(-1).mean(-1) * action_mask).sum()
-            if action_mask.sum() > 0:
-                l_action = l_action / action_mask.sum()
+            action_diff = (action_pred - action_label) ** 2
+            # Supervise all T waypoints — clamped-at-target labels are correct.
+            eff_mask = action_mask.unsqueeze(1).expand(-1, action_pred.shape[1])  # [B, T]
+            l_action = (action_diff.mean(-1) * eff_mask).sum()
+            if eff_mask.sum() > 0:
+                l_action = l_action / eff_mask.sum()
 
             l_gnm = alpha_dist * l_dist + (1.0 - alpha_dist) * l_action
 
-            # ---- Combined loss & backward --------------------------------
-            total_loss = l_lang + lambda_ogcl * l_ogcl + lambda_action * l_gnm
+            # ---- Single backward -----------------------------------------
+            # l_lange3d (weight=1) → updates lange3d_model directly
+            # lambda_action * l_gnm → updates gnm_model + lange3d_model (via lang_preds)
+            total_loss = l_lange3d + lambda_action * l_gnm
             total_loss.backward()
 
             torch.nn.utils.clip_grad_norm_(lange3d_model.parameters(), 1.0)
             torch.nn.utils.clip_grad_norm_(gnm_model.parameters(), 1.0)
-
             lange3d_optimizer.step()
             gnm_optimizer.step()
 
@@ -513,6 +507,7 @@ def train_eval_loop_joint(
                 gnm_masks     = batch["gnm_masks"].to(device)
                 K_list        = batch["K_list"]
                 action_label  = batch["action_label"].to(device)
+                wp_mask       = batch["wp_mask"].to(device)           # [B, T]
                 action_mask   = batch["action_mask"].to(device)
                 dist_label    = batch["dist_label"].to(device)
 
@@ -540,9 +535,10 @@ def train_eval_loop_joint(
                 dist_label_f = dist_label.float().unsqueeze(1)
                 l_dist   = F.mse_loss(dist_pred, dist_label_f)
                 a_diff   = (action_pred - action_label) ** 2
-                l_action_v = (a_diff.mean(-1).mean(-1) * action_mask).sum()
-                if action_mask.sum() > 0:
-                    l_action_v = l_action_v / action_mask.sum()
+                eff_mask_v = action_mask.unsqueeze(1).expand(-1, action_pred.shape[1])  # [B, T]
+                l_action_v = (a_diff.mean(-1) * eff_mask_v).sum()
+                if eff_mask_v.sum() > 0:
+                    l_action_v = l_action_v / eff_mask_v.sum()
 
                 l_gnm_v = alpha_dist * l_dist + (1.0 - alpha_dist) * l_action_v
                 total_v = l_lang + lambda_ogcl * l_ogcl_v + lambda_action * l_gnm_v
@@ -557,15 +553,17 @@ def train_eval_loop_joint(
                 if not viz_done:
                     pv_cpu = pixel_values.cpu()
                     ap_cpu = action_pred.cpu()
+                    nai_texts = batch.get("nai_text", [""] * B)
                     for b in range(min(4, B)):
                         viz_samples.append({
                             "pixel_values": pv_cpu[b],
                             # masks_list[b] lives on device; batch["masks_list"][b] is CPU
                             "masks":        batch["masks_list"][b],
                             "gt_costs":     gt_costs_list[b].cpu(),
-                            "pred_costs":   torch.sigmoid(lang_preds[b]).cpu(),
+                            "pred_costs":   (lambda p: (p - p.min()) / (p.max() - p.min() + 1e-8))(lang_preds[b].cpu()),
                             "gt_action":    batch["action_label"][b],    # CPU
                             "pred_action":  ap_cpu[b],
+                            "nai_text":     nai_texts[b] if b < len(nai_texts) else "",
                         })
                     viz_done = True
 
@@ -595,6 +593,7 @@ def train_eval_loop_joint(
                     s["pixel_values"], s["masks"],
                     s["gt_costs"], s["pred_costs"],
                     s["gt_action"], s["pred_action"],
+                    nai_text=s.get("nai_text", ""),
                 )
                 canvas_imgs.append(
                     wandb.Image(canvas, caption=f"ep{epoch}_s{idx}")

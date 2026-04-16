@@ -358,7 +358,6 @@ class JointEpisodeDataset(Dataset):
                     K = len(raw_costs)
 
                     # ---- Action label: interpolate to min-cost object --------
-                    # Find the object with the smallest raw path-length cost.
                     finite_mask = np.isfinite(raw_costs)
                     if finite_mask.any():
                         best_k  = int(np.argmin(
@@ -366,14 +365,38 @@ class JointEpisodeDataset(Dataset):
                         ))
                         target_world = obb_centers[best_k]   # [3] world XYZ
 
-                        # Interpolate T+1 points from agent→target, drop t=0.
-                        alphas = np.linspace(0.0, 1.0, T + 1)[1:]  # (0,1] exclusive start
+                        # --- Fix 1: cap target distance -------------------
+                        MAX_TARGET_DIST = 25.0          # metres
+                        dir_vec  = target_world - curr_pos
+                        dist_3d  = float(np.linalg.norm(dir_vec))
+                        if dist_3d > MAX_TARGET_DIST and dist_3d > 1e-4:
+                            target_world = curr_pos + dir_vec * (MAX_TARGET_DIST / dist_3d)
+
+                        # --- Fix 2: correct yaw labels --------------------
+                        target_local = _to_local_coords_2d(target_world, curr_pos, curr_rot)
+                        dist_2d = float(np.linalg.norm(target_local))
+                        if dist_2d > 1e-4:
+                            cos_yaw = float(target_local[0] / dist_2d)
+                            sin_yaw = float(target_local[1] / dist_2d)
+                        else:
+                            cos_yaw, sin_yaw = 1.0, 0.0
+
+                        STEP_SIZE    = 0.5  # metres per step
                         action_label = np.zeros((T, 4), dtype=np.float32)
-                        for t, a in enumerate(alphas):
-                            wp_world = curr_pos + a * (target_world - curr_pos)
-                            xy   = _to_local_coords_2d(wp_world, curr_pos, curr_rot)
-                            # No yaw change — heading toward target is implicit in XY.
-                            action_label[t] = [xy[0], xy[1], 1.0, 0.0]  # cos=1, sin=0
+                        # per-waypoint mask: 1 if still moving, 0 once clamped
+                        wp_mask = np.zeros(T, dtype=np.float32)
+                        for t in range(T):
+                            d = (t + 1) * STEP_SIZE
+                            if d <= dist_2d:
+                                ratio = d / dist_2d if dist_2d > 1e-4 else 1.0
+                                wp_mask[t] = 1.0
+                            else:
+                                ratio = 1.0   # clamped at target
+                            wp_world = curr_pos + ratio * (target_world - curr_pos)
+                            xy = _to_local_coords_2d(wp_world, curr_pos, curr_rot)
+                            action_label[t] = [xy[0], xy[1], cos_yaw, sin_yaw]
+                        # action_mask: scalar — episode is valid; wp_mask stored separately
+                        action_mask = 1.0
                         action_mask = 1.0
                     else:
                         action_label = np.zeros((T, 4), dtype=np.float32)
@@ -390,6 +413,7 @@ class JointEpisodeDataset(Dataset):
                         "raw_costs":    raw_costs,     # [K] float64
                         "cat_names":    cat_names,     # [K] str
                         "action_label": action_label,  # [T, 4] float32
+                        "wp_mask":      wp_mask if finite_mask.any() else np.zeros(T, dtype=np.float32),  # [T]
                         "action_mask":  float(action_mask),
                         "dist_label":   dist_label,    # int
                     })
@@ -477,6 +501,7 @@ class JointEpisodeDataset(Dataset):
 
         # ---- Action label (pre-computed at index time from graph poses) ----
         action_label = meta["action_label"]          # [T, 4] float32
+        wp_mask      = meta["wp_mask"]               # [T] float32 — 1 while moving
         action_mask  = meta["action_mask"]           # float
         dist_label   = meta["dist_label"]            # int
         has_target   = False
@@ -493,11 +518,14 @@ class JointEpisodeDataset(Dataset):
             # GNM
             "gnm_masks":      torch.from_numpy(gnm_masks),           # [K, Hh, Wh]
             "action_label":   torch.from_numpy(action_label),        # [T, 4]
+            "wp_mask":        torch.from_numpy(wp_mask),             # [T]
             "dist_label":     torch.tensor(dist_label, dtype=torch.int64),
             "action_mask":    torch.tensor(action_mask, dtype=torch.float32),
             # Success metric
             "target_bearing": torch.tensor(target_bearing, dtype=torch.float32),
             "has_target":     torch.tensor(has_target, dtype=torch.bool),
+            # Instruction text for visualization
+            "nai_text":       nai_text,
         }
 
 
@@ -533,11 +561,14 @@ def joint_collate_fn(batch: list[dict]) -> dict:
         "gnm_masks":        gnm_masks_padded,
         "K_list":           K_list,
         "action_label":     torch.stack([b["action_label"] for b in batch]),
+        "wp_mask":          torch.stack([b["wp_mask"]      for b in batch]),
         "dist_label":       torch.stack([b["dist_label"]   for b in batch]),
         "action_mask":      torch.stack([b["action_mask"]  for b in batch]),
         # Success metric
         "target_bearing":   torch.stack([b["target_bearing"] for b in batch]),
         "has_target":       torch.stack([b["has_target"]     for b in batch]),
+        # Instruction text for visualization
+        "nai_text":         [b["nai_text"] for b in batch],
     }
 
 
