@@ -535,7 +535,7 @@ def train_eval_loop_joint(
                 dist_label_f = dist_label.float().unsqueeze(1)
                 l_dist   = F.mse_loss(dist_pred, dist_label_f)
                 a_diff   = (action_pred - action_label) ** 2
-                eff_mask_v = action_mask.unsqueeze(1).expand(-1, action_pred.shape[1])  # [B, T]
+                eff_mask_v = wp_mask * action_mask.unsqueeze(1)  # [B, T]
                 l_action_v = (a_diff.mean(-1) * eff_mask_v).sum()
                 if eff_mask_v.sum() > 0:
                     l_action_v = l_action_v / eff_mask_v.sum()
