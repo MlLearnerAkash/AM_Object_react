@@ -17,6 +17,14 @@ from torchvision import transforms
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.training_utils import EMAModel
 
+try:
+    from scipy.stats import spearmanr as _spearmanr
+    _SCIPY_OK = True
+except ImportError:
+    _SCIPY_OK = False
+
+# Backbone parameter name prefixes (same convention as lange3dnet_train/train.py)
+_BACKBONE_PREFIXES = ("clip", "dino", "bert")
 
 def train_eval_loop(
     train_model: bool,
@@ -401,6 +409,11 @@ def train_eval_loop_joint(
 
             B = pixel_values.shape[0]
 
+            # Skip batches where every sample has no segmented objects — mirrors
+            # train.py behaviour; prevents NaNs and wasted cost-head compute.
+            if all(m.shape[0] == 0 for m in masks_list):
+                continue
+
             lange3d_optimizer.zero_grad()
             gnm_optimizer.zero_grad()
 
@@ -413,9 +426,10 @@ def train_eval_loop_joint(
             l_lang, _ = lange3d_loss_fn(lang_preds, gt_costs_list)
 
             l_ogcl = torch.tensor(0.0, device=device)
-            if ogcl_criterion is not None and class_match_list:
-                class_match_dev = [m.to(device) for m in class_match_list]
-                l_ogcl = ogcl_criterion(lang_preds, class_match_dev)
+            if ogcl_criterion is not None:
+                class_match_list = [m.to(device) for m in batch.get('class_match_list', [])]
+                if class_match_list:
+                    l_ogcl = ogcl_criterion(lang_preds, class_match_list)
 
             l_lange3d = l_lang + lambda_ogcl * l_ogcl
 
@@ -431,8 +445,8 @@ def train_eval_loop_joint(
             l_dist = F.mse_loss(dist_pred, dist_label.float().unsqueeze(1))
 
             action_diff = (action_pred - action_label) ** 2
-            # Supervise all T waypoints — clamped-at-target labels are correct.
-            eff_mask = action_mask.unsqueeze(1).expand(-1, action_pred.shape[1])  # [B, T]
+            # Use wp_mask to exclude clamped (stop-in-place) waypoints from loss.
+            eff_mask = action_mask.unsqueeze(1).expand(-1, action_pred.shape[1])  # [B, T] #wp_mask * action_mask.unsqueeze(1)  # [B, T]
             l_action = (action_diff.mean(-1) * eff_mask).sum()
             if eff_mask.sum() > 0:
                 l_action = l_action / eff_mask.sum()
@@ -475,7 +489,8 @@ def train_eval_loop_joint(
                 })
                 running_loss_total = running_loss_lang = running_loss_gnm = running_loss_ogcl = 0.0
                 n_batches = 0
-
+            # if batch_idx >2:
+            #     break
         # LR schedulers
         if lange3d_scheduler is not None:
             lange3d_scheduler.step()
@@ -494,10 +509,15 @@ def train_eval_loop_joint(
         val_loss_gnm   = 0.0
         val_n = 0
 
+        # Collect GT and predicted costs across val batches for Spearman ρ
+        _gt_costs_all:   list = []
+        _pred_costs_all: list = []
+
         viz_samples: list = []   # collect first few samples for canvas logging
         viz_done    = False
 
         with torch.no_grad():
+            i=0
             for batch in val_loader:
                 pixel_values = batch["pixel_values"].to(device)
                 nai_input_ids = batch["nai_input_ids"].to(device)
@@ -516,11 +536,12 @@ def train_eval_loop_joint(
                 )
                 l_lang, _ = lange3d_loss_fn(lang_preds, gt_costs_list)
 
-                # OGCL on val set (for monitoring collapse)
+                # OGCL on val set — same as train.py
                 l_ogcl_v = torch.tensor(0.0, device=device)
-                if ogcl_criterion is not None and batch.get("class_match_list"):
-                    cm_dev   = [m.to(device) for m in batch["class_match_list"]]
-                    l_ogcl_v = ogcl_criterion(lang_preds, cm_dev)
+                if ogcl_criterion is not None:
+                    cm_dev = [m.to(device) for m in batch.get('class_match_list', [])]
+                    if cm_dev:
+                        l_ogcl_v = ogcl_criterion(lang_preds, cm_dev)
 
                 goal_enc = topopaths.build_differentiable_goal(
                     lang_preds, gnm_masks, K_list, device
@@ -549,6 +570,13 @@ def train_eval_loop_joint(
                 val_loss_gnm   += l_gnm_v.item()
                 val_n += 1
 
+                # Apply sigmoid to raw logits so both arrays are in [0, 1] —
+                for b in range(pixel_values.shape[0]):
+                    _gt_costs_all.append(gt_costs_list[b].cpu().numpy())
+                    _pred_costs_all.append(
+                        torch.sigmoid(lang_preds[b]).detach().cpu().numpy()
+                    )
+
                 # Collect viz samples from the first validation batch only.
                 if not viz_done:
                     pv_cpu = pixel_values.cpu()
@@ -557,7 +585,6 @@ def train_eval_loop_joint(
                     for b in range(min(4, B)):
                         viz_samples.append({
                             "pixel_values": pv_cpu[b],
-                            # masks_list[b] lives on device; batch["masks_list"][b] is CPU
                             "masks":        batch["masks_list"][b],
                             "gt_costs":     gt_costs_list[b].cpu(),
                             "pred_costs":   (lambda p: (p - p.min()) / (p.max() - p.min() + 1e-8))(lang_preds[b].cpu()),
@@ -566,11 +593,24 @@ def train_eval_loop_joint(
                             "nai_text":     nai_texts[b] if b < len(nai_texts) else "",
                         })
                     viz_done = True
-
+                # i+=1
+                # if i>2:
+                #     break
         avg_val      = val_loss_total / max(val_n, 1)
         avg_val_lang = val_loss_lang  / max(val_n, 1)
         avg_val_ogcl = val_loss_ogcl  / max(val_n, 1)
         avg_val_gnm  = val_loss_gnm   / max(val_n, 1)
+
+        # ---- Spearman rank correlation (cost prediction quality) ---------
+        val_spearman = float("nan")
+        if _SCIPY_OK and _gt_costs_all:
+            try:
+                gt_flat   = np.concatenate(_gt_costs_all)
+                pred_flat = np.concatenate(_pred_costs_all)
+                if len(gt_flat) > 2 and gt_flat.std() > 1e-8:
+                    val_spearman = float(_spearmanr(gt_flat, pred_flat).correlation)
+            except Exception:
+                pass
 
         success_metrics = compute_success_rate(
             gnm_model, lange3d_model, val_loader, topopaths, device,
@@ -581,7 +621,8 @@ def train_eval_loop_joint(
         print(
             f"Epoch {epoch} | val_loss={avg_val:.4f}"
             f"  lang={avg_val_lang:.4f}  ogcl={avg_val_ogcl:.4f}"
-            f"  gnm={avg_val_gnm:.4f}  success={success_rate:.3f}  nDTW={ndtw:.3f}"
+            f"  gnm={avg_val_gnm:.4f}  success={success_rate:.3f}"
+            f"  nDTW={ndtw:.3f}  spearman={val_spearman:.3f}"
         )
 
         # ---- Build visualisation canvases --------------------------------
@@ -602,30 +643,33 @@ def train_eval_loop_joint(
             print(f"[viz] canvas generation failed: {exc}")
 
         log_dict = {
-            "val/loss_total":   avg_val,
-            "val/loss_lang":    avg_val_lang,
-            "val/loss_ogcl":    avg_val_ogcl,
-            "val/loss_gnm":     avg_val_gnm,
-            "val/success_rate": success_rate,
-            "val/nDTW":         ndtw,
+            "val/loss_total":       avg_val,
+            "val/loss_lang":        avg_val_lang,
+            "val/loss_ogcl":        avg_val_ogcl,
+            "val/loss_gnm":         avg_val_gnm,
+            "val/success_rate":     success_rate,
+            "val/nDTW":             ndtw,
+            "val/spearman_rho":     val_spearman,
             "epoch": epoch,
         }
         if canvas_imgs:
             log_dict["val/viz"] = canvas_imgs
         wandb.log(log_dict)
 
-        # Save checkpoint
-        if avg_val < best_val_loss:
-            best_val_loss = avg_val
+        # Save checkpoint — criterion is val lang loss (pure cost-prediction
+        # quality), not total loss which includes GNM and can mask lang regression.
+        if avg_val_lang < best_val_loss:
+            best_val_loss = avg_val_lang
             torch.save({
                 "epoch":            epoch,
                 "lange3d":          lange3d_model.state_dict(),
                 "gnm":              gnm_model.state_dict(),
                 "lange3d_opt":      lange3d_optimizer.state_dict(),
                 "gnm_opt":          gnm_optimizer.state_dict(),
-                "val_loss":         avg_val,
+                "val_loss_lang":    avg_val_lang,
+                "val_spearman":     val_spearman,
             }, os.path.join(save_dir, "best_joint.pth"))
-            print(f"  → best checkpoint saved (val_loss={avg_val:.4f})")
+            print(f"  → best checkpoint saved (val_lang={avg_val_lang:.4f}, spearman={val_spearman:.3f})")
 
         torch.save({
             "epoch":        epoch,

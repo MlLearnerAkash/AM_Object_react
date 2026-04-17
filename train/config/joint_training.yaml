@@ -96,7 +96,7 @@ alpha: 0.5                # l_gnm = alpha * l_dist + (1 - alpha) * l_action
 # Training schedule
 # ============================================================
 
-epochs: 300
+epochs: 600
 warmup_epochs: 3
 batch_size: 16
 num_workers: 8

@@ -357,22 +357,72 @@ class JointEpisodeDataset(Dataset):
                     raw_costs, cat_names, curr_pos, curr_rot, obb_centers = frame_data[frame_key]
                     K = len(raw_costs)
 
-                    # ---- Action label: interpolate to min-cost object --------
+                    # ---- Per-frame NAI text (primary) or episode instruction (fallback) ----
+                    _frame_grp = ep_grp["frames"][frame_key]
+                    if "next_action_instruction" in _frame_grp:
+                        _raw_nai = _frame_grp["next_action_instruction"][()]
+                        nai_text = (_raw_nai.decode("utf-8")
+                                    if isinstance(_raw_nai, bytes) else str(_raw_nai))
+                    else:
+                        nai_text = ""
+                    if not nai_text.strip():
+                        nai_text = instruction
+
+                    # ---- Target object selection ----------------------------
+                    # Each frame is treated as a self-contained episode.
+                    # Primary: lowest-Dijkstra-cost object whose category is
+                    # mentioned in the per-frame NAI.
+                    # Fallback: globally cheapest object in this frame.
+                    # The selected object is the single reference for both
+                    # regression (its gt_cost is the anchor) and OGCL (its
+                    # category becomes the positive class), ensuring the two
+                    # losses always push in the same direction.
                     finite_mask = np.isfinite(raw_costs)
-                    if finite_mask.any():
-                        best_k  = int(np.argmin(
+                    nai_class   = _parse_nai_class(nai_text)
+                    target_k    = None
+                    nai_matched = False
+                    if nai_class and finite_mask.any():
+                        _nai_match = np.array([c == nai_class for c in cat_names], dtype=bool)
+                        _valid     = _nai_match & finite_mask
+                        if _valid.any():
+                            target_k    = int(np.argmin(np.where(_valid, raw_costs, np.inf)))
+                            nai_matched = True
+                    # Fallback: least-cost object globally in this frame.
+                    if target_k is None and finite_mask.any():
+                        target_k = int(np.argmin(np.where(finite_mask, raw_costs, np.inf)))
+                        # Text must reference the target's class; episode
+                        # instruction is the closest match for the destination.
+                        nai_text = instruction
+
+                    # Category of the selected target — used for class_match.
+                    target_cat = (cat_names[target_k]
+                                  if target_k is not None and target_k < len(cat_names)
+                                  else "")
+
+                    # OGCL guard: also disable when a cheaper non-NAI object
+                    # exists.  If raw_costs[global_min] < raw_costs[target_k],
+                    # regression would push that object lower than target_k —
+                    # directly contradicting OGCL's ranking signal.
+                    nai_is_global_min = False
+                    if nai_matched and target_k is not None and finite_mask.any():
+                        global_min_k = int(np.argmin(
                             np.where(finite_mask, raw_costs, np.inf)
                         ))
-                        target_world = obb_centers[best_k]   # [3] world XYZ
+                        # True when the NAI-class anchor IS the global cheapest
+                        # (or tied for cheapest — same raw cost).
+                        nai_is_global_min = (
+                            raw_costs[target_k] <= raw_costs[global_min_k] + 1e-8
+                        )
 
-                        # --- Fix 1: cap target distance -------------------
+                    if target_k is not None:
+                        target_world = obb_centers[target_k]   # [3] world XYZ
+
                         MAX_TARGET_DIST = 25.0          # metres
                         dir_vec  = target_world - curr_pos
                         dist_3d  = float(np.linalg.norm(dir_vec))
                         if dist_3d > MAX_TARGET_DIST and dist_3d > 1e-4:
                             target_world = curr_pos + dir_vec * (MAX_TARGET_DIST / dist_3d)
 
-                        # --- Fix 2: correct yaw labels --------------------
                         target_local = _to_local_coords_2d(target_world, curr_pos, curr_rot)
                         dist_2d = float(np.linalg.norm(target_local))
                         if dist_2d > 1e-4:
@@ -383,39 +433,43 @@ class JointEpisodeDataset(Dataset):
 
                         STEP_SIZE    = 0.5  # metres per step
                         action_label = np.zeros((T, 4), dtype=np.float32)
-                        # per-waypoint mask: 1 if still moving, 0 once clamped
-                        wp_mask = np.zeros(T, dtype=np.float32)
+                        wp_mask      = np.zeros(T, dtype=np.float32)
                         for t in range(T):
                             d = (t + 1) * STEP_SIZE
                             if d <= dist_2d:
                                 ratio = d / dist_2d if dist_2d > 1e-4 else 1.0
                                 wp_mask[t] = 1.0
                             else:
-                                ratio = 1.0   # clamped at target
+                                ratio = 1.0
                             wp_world = curr_pos + ratio * (target_world - curr_pos)
                             xy = _to_local_coords_2d(wp_world, curr_pos, curr_rot)
                             action_label[t] = [xy[0], xy[1], cos_yaw, sin_yaw]
-                        # action_mask: scalar — episode is valid; wp_mask stored separately
-                        action_mask = 1.0
-                        action_mask = 1.0
+                        action_mask     = 1.0
+                        # Per-frame dist_label: physical distance to target / MAX_TARGET_DIST → [0, 1]
+                        #NOTE: intra-frame, not much distances
+                        dist_label_norm = dist_2d #/ MAX_TARGET_DIST 
                     else:
-                        action_label = np.zeros((T, 4), dtype=np.float32)
-                        action_mask  = 0.0
-
-                    # dist_label: remaining H5 frames to goal.
-                    dist_label = len(valid_keys) - 1 - seq_idx
+                        action_label    = np.zeros((T, 4), dtype=np.float32)
+                        wp_mask         = np.zeros(T, dtype=np.float32)
+                        action_mask     = 0.0
+                        dist_label_norm = 0.0
 
                     self.frames.append({
                         "ep_id":        ep_id,
                         "frame_key":    frame_key,
                         "instruction":  instruction,
+                        "nai_text":     nai_text,      # per-frame NAI or episode instruction
                         "K":            K,
                         "raw_costs":    raw_costs,     # [K] float64
                         "cat_names":    cat_names,     # [K] str
+                        "target_k":     target_k if target_k is not None else -1,
+                        "target_cat":   target_cat,    # category of the selected anchor object
+                        "nai_matched":  nai_matched,   # False → OGCL disabled for this frame
+                        "nai_is_global_min": nai_is_global_min,  # False → cheaper non-NAI object exists → OGCL off
                         "action_label": action_label,  # [T, 4] float32
-                        "wp_mask":      wp_mask if finite_mask.any() else np.zeros(T, dtype=np.float32),  # [T]
+                        "wp_mask":      wp_mask,       # [T] — 0 when no target or clamped
                         "action_mask":  float(action_mask),
-                        "dist_label":   dist_label,    # int
+                        "dist_label":   dist_label_norm,  # float [0, 1]: physical dist/25m
                     })
                     n_frames += 1
 
@@ -465,13 +519,8 @@ class JointEpisodeDataset(Dataset):
         gt_costs = _minmax_normalize(meta["raw_costs"])       # [K] float32 in [0,1]
 
         # ---- NAI text → tokens -----------------------------------------
-        nai_text = ""
-        if "next_action_instruction" in fg:
-            raw = fg["next_action_instruction"][()]
-            nai_text = (raw.decode("utf-8")
-                        if isinstance(raw, bytes) else str(raw))
-        if not nai_text.strip():
-            nai_text = meta["instruction"]
+        # nai_text resolved at index time: per-frame NAI or episode instruction fallback.
+        nai_text = meta["nai_text"]
 
         nai_tok = self.clip_processor(
             text=nai_text,
@@ -482,15 +531,23 @@ class JointEpisodeDataset(Dataset):
         nai_attn_mask = nai_tok["attention_mask"].squeeze(0)  # [77]
 
         # ---- Class match for OGCL --------------------------------------
-        # Use category names extracted from graph node attributes at index time.
-        nai_class   = _parse_nai_class(nai_text)
-        cat_names   = meta["cat_names"]                        # [K] str
-        if nai_class:
-            class_match = np.array(
-                [c == nai_class for c in cat_names], dtype=bool
-            )
-        else:
-            class_match = np.zeros(K, dtype=bool)
+        # OGCL is active only when:
+        #   1. nai_matched=True  — NAI class found an object in this frame
+        #   2. nai_is_global_min — the NAI-class anchor is also the globally
+        #      cheapest object; if a cheaper non-NAI object exists, regression
+        #      pushes it lower than the anchor, conflicting with OGCL.
+        #
+        # Only target_k is marked positive (not all same-category objects).
+        # Other same-class objects may have GT cost > some negatives, so
+        # marking them positive causes regression and OGCL to fight:
+        # regression pushes their logit UP (high cost) while OGCL pushes DOWN.
+        target_cat        = meta.get("target_cat", "")
+        nai_matched       = meta.get("nai_matched", False)
+        nai_is_global_min = meta.get("nai_is_global_min", False)
+        target_k_idx      = meta.get("target_k", -1)
+        class_match = np.zeros(K, dtype=bool)
+        if target_cat and nai_matched and nai_is_global_min and 0 <= target_k_idx < K:
+            class_match[target_k_idx] = True
 
         # ---- GNM masks (resized to [K, gnm_mask_h, gnm_mask_w]) --------
         gnm_masks = _resize_masks_to(
@@ -500,10 +557,10 @@ class JointEpisodeDataset(Dataset):
         )                          # [K, gnm_mask_h, gnm_mask_w] float32
 
         # ---- Action label (pre-computed at index time from graph poses) ----
-        action_label = meta["action_label"]          # [T, 4] float32
-        wp_mask      = meta["wp_mask"]               # [T] float32 — 1 while moving
-        action_mask  = meta["action_mask"]           # float
-        dist_label   = meta["dist_label"]            # int
+        action_label    = meta["action_label"]          # [T, 4] float32
+        wp_mask         = meta["wp_mask"]               # [T] float32 — 1 while moving
+        action_mask     = meta["action_mask"]           # float
+        dist_label_norm = meta["dist_label"]            # float [0, 1]: physical dist/25m
         has_target   = False
         target_bearing = 0.0
 
@@ -519,11 +576,13 @@ class JointEpisodeDataset(Dataset):
             "gnm_masks":      torch.from_numpy(gnm_masks),           # [K, Hh, Wh]
             "action_label":   torch.from_numpy(action_label),        # [T, 4]
             "wp_mask":        torch.from_numpy(wp_mask),             # [T]
-            "dist_label":     torch.tensor(dist_label, dtype=torch.int64),
+            "dist_label":     torch.tensor(dist_label_norm, dtype=torch.float32),
             "action_mask":    torch.tensor(action_mask, dtype=torch.float32),
             # Success metric
             "target_bearing": torch.tensor(target_bearing, dtype=torch.float32),
             "has_target":     torch.tensor(has_target, dtype=torch.bool),
+            # Pre-selected target object index (NAI-class min-cost or global min-cost fallback, -1 if none)
+            "target_idx":     torch.tensor(meta.get("target_k", -1), dtype=torch.long),
             # Instruction text for visualization
             "nai_text":       nai_text,
         }
@@ -567,6 +626,8 @@ def joint_collate_fn(batch: list[dict]) -> dict:
         # Success metric
         "target_bearing":   torch.stack([b["target_bearing"] for b in batch]),
         "has_target":       torch.stack([b["has_target"]     for b in batch]),
+        # Per-frame selected target object index [B] int64; -1 means no valid target
+        "target_idx":       torch.stack([b["target_idx"]     for b in batch]),
         # Instruction text for visualization
         "nai_text":         [b["nai_text"] for b in batch],
     }
@@ -589,16 +650,14 @@ def create_joint_dataloaders(
     gnm_mask_h: int = 60,
     gnm_mask_w: int = 80,
 ) -> tuple:
-    """Return (train_loader, val_loader) with an episode-level split."""
+    """Return (train_loader, val_loader) with a frame-level split.
+
+    All episodes are indexed first (so every scene is seen in both splits),
+    then frames are split randomly.  This prevents scene-level distribution
+    shift that would cause val loss to plateau while train loss drops.
+    """
     with h5py.File(h5_path, "r") as hf:
         all_keys = sorted(hf.keys())
-
-    rng = random.Random(seed)
-    keys = list(all_keys)
-    rng.shuffle(keys)
-    split_idx = int(len(keys) * (1 - val_split))
-    train_ids = keys[:split_idx]
-    val_ids   = keys[split_idx:]
 
     ds_kw = dict(
         clip_model_name=clip_model,
@@ -608,8 +667,19 @@ def create_joint_dataloaders(
         gnm_mask_h=gnm_mask_h,
         gnm_mask_w=gnm_mask_w,
     )
-    train_ds = JointEpisodeDataset(h5_path, train_ids, **ds_kw)
-    val_ds   = JointEpisodeDataset(h5_path, val_ids,   **ds_kw)
+    # Build a single dataset over all episodes, then split its frame index.
+    full_ds = JointEpisodeDataset(h5_path, all_keys, **ds_kw)
+
+    rng = random.Random(seed)
+    indices = list(range(len(full_ds)))
+    rng.shuffle(indices)
+    split_idx  = int(len(indices) * (1 - val_split))
+    train_idx  = indices[:split_idx]
+    val_idx    = indices[split_idx:]
+
+    from torch.utils.data import Subset
+    train_ds = Subset(full_ds, train_idx)
+    val_ds   = Subset(full_ds, val_idx)
 
     loader_kw = dict(
         collate_fn=joint_collate_fn,
