@@ -369,14 +369,6 @@ class JointEpisodeDataset(Dataset):
                         nai_text = instruction
 
                     # ---- Target object selection ----------------------------
-                    # Each frame is treated as a self-contained episode.
-                    # Primary: lowest-Dijkstra-cost object whose category is
-                    # mentioned in the per-frame NAI.
-                    # Fallback: globally cheapest object in this frame.
-                    # The selected object is the single reference for both
-                    # regression (its gt_cost is the anchor) and OGCL (its
-                    # category becomes the positive class), ensuring the two
-                    # losses always push in the same direction.
                     finite_mask = np.isfinite(raw_costs)
                     nai_class   = _parse_nai_class(nai_text)
                     target_k    = None
@@ -392,17 +384,13 @@ class JointEpisodeDataset(Dataset):
                         target_k = int(np.argmin(np.where(finite_mask, raw_costs, np.inf)))
                         # Text must reference the target's class; episode
                         # instruction is the closest match for the destination.
-                        nai_text = instruction
+                        nai_text = nai_text #instruction
 
                     # Category of the selected target — used for class_match.
                     target_cat = (cat_names[target_k]
                                   if target_k is not None and target_k < len(cat_names)
                                   else "")
 
-                    # OGCL guard: also disable when a cheaper non-NAI object
-                    # exists.  If raw_costs[global_min] < raw_costs[target_k],
-                    # regression would push that object lower than target_k —
-                    # directly contradicting OGCL's ranking signal.
                     nai_is_global_min = False
                     if nai_matched and target_k is not None and finite_mask.any():
                         global_min_k = int(np.argmin(
@@ -530,17 +518,7 @@ class JointEpisodeDataset(Dataset):
         nai_input_ids = nai_tok["input_ids"].squeeze(0)       # [77]
         nai_attn_mask = nai_tok["attention_mask"].squeeze(0)  # [77]
 
-        # ---- Class match for OGCL --------------------------------------
-        # OGCL is active only when:
-        #   1. nai_matched=True  — NAI class found an object in this frame
-        #   2. nai_is_global_min — the NAI-class anchor is also the globally
-        #      cheapest object; if a cheaper non-NAI object exists, regression
-        #      pushes it lower than the anchor, conflicting with OGCL.
-        #
-        # Only target_k is marked positive (not all same-category objects).
-        # Other same-class objects may have GT cost > some negatives, so
-        # marking them positive causes regression and OGCL to fight:
-        # regression pushes their logit UP (high cost) while OGCL pushes DOWN.
+
         target_cat        = meta.get("target_cat", "")
         nai_matched       = meta.get("nai_matched", False)
         nai_is_global_min = meta.get("nai_is_global_min", False)
@@ -585,6 +563,11 @@ class JointEpisodeDataset(Dataset):
             "target_idx":     torch.tensor(meta.get("target_k", -1), dtype=torch.long),
             # Instruction text for visualization
             "nai_text":       nai_text,
+            # Metadata for evaluation grouping
+            "ep_id":          ep_id,
+            "frame_key":      frame_key,
+            "nai_matched":    nai_matched,
+            "nai_is_global_min": nai_is_global_min,
         }
 
 
@@ -630,6 +613,11 @@ def joint_collate_fn(batch: list[dict]) -> dict:
         "target_idx":       torch.stack([b["target_idx"]     for b in batch]),
         # Instruction text for visualization
         "nai_text":         [b["nai_text"] for b in batch],
+        # Metadata for evaluation grouping
+        "ep_id":            [b["ep_id"]   for b in batch],
+        "frame_key":        [b["frame_key"] for b in batch],
+        "nai_matched":      [b["nai_matched"] for b in batch],
+        "nai_is_global_min": [b["nai_is_global_min"] for b in batch],
     }
 
 
