@@ -489,8 +489,8 @@ def train_eval_loop_joint(
                 })
                 running_loss_total = running_loss_lang = running_loss_gnm = running_loss_ogcl = 0.0
                 n_batches = 0
-            # if batch_idx >2:
-            #     break
+            if batch_idx >2:
+                break
         # LR schedulers
         if lange3d_scheduler is not None:
             lange3d_scheduler.step()
@@ -570,11 +570,13 @@ def train_eval_loop_joint(
                 val_loss_gnm   += l_gnm_v.item()
                 val_n += 1
 
-                # Apply sigmoid to raw logits so both arrays are in [0, 1] —
+                # Min-max normalise raw logits to [0, 1] for Spearman tracking
                 for b in range(pixel_values.shape[0]):
                     _gt_costs_all.append(gt_costs_list[b].cpu().numpy())
+                    raw = lang_preds[b].detach().cpu().float()
+                    rng = raw.max() - raw.min()
                     _pred_costs_all.append(
-                        torch.sigmoid(lang_preds[b]).detach().cpu().numpy()
+                        ((raw - raw.min()) / (rng + 1e-8)).numpy()
                     )
 
                 # Collect viz samples from the first validation batch only.
@@ -593,9 +595,9 @@ def train_eval_loop_joint(
                             "nai_text":     nai_texts[b] if b < len(nai_texts) else "",
                         })
                     viz_done = True
-                # i+=1
-                # if i>2:
-                #     break
+                i+=1
+                if i>2:
+                    break
         avg_val      = val_loss_total / max(val_n, 1)
         avg_val_lang = val_loss_lang  / max(val_n, 1)
         avg_val_ogcl = val_loss_ogcl  / max(val_n, 1)

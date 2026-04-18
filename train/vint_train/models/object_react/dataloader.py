@@ -157,7 +157,9 @@ class TopoPaths:
                 results.append(torch.cat([viz, img_enc], dim=0))
                 continue
 
-            costs = torch.sigmoid(logits)         # [K] ∈ (0,1), in grad graph
+            # Min-max normalise raw logits → full [0,1] range for blend weights
+            lo = logits.min()
+            costs = (logits - lo) / (logits.max() - lo + 1e-8)  # [K] ∈ [0,1]
             # Soft blend of near_enc and far_enc per object:
             #   enc_k = (1 - cost_k) * near_enc + cost_k * far_enc   [K, dims]
             weights_near = (1.0 - costs).unsqueeze(1)   # [K, 1]
@@ -191,7 +193,7 @@ class TopoPaths:
 
         Parameters
         ----------
-        pred_logits : Tensor[K]  raw logits (will be sigmoid'd here)
+        pred_logits : Tensor[K]  raw logits (min-max normalised to [0,1] for goal blending)
         masks       : Tensor[K, H//2, W//2] float32
 
         Returns
@@ -199,7 +201,9 @@ class TopoPaths:
         img_enc      : ndarray [dims, H//2, W//2]
         plWtColorImg : ndarray [3, H//2, W//2]
         """
-        costs = torch.sigmoid(pred_logits).detach().cpu().numpy()  # [K]
+        logits_t = pred_logits.detach().cpu().float()
+        lo = logits_t.min()
+        costs = ((logits_t - lo) / (logits_t.max() - lo + 1e-8)).numpy()  # [K] ∈ [0,1]
         pls_approx = (costs * (self.rank_enc.shape[0] - 1)).astype(int)
         pls_approx = np.clip(pls_approx, 0, self.rank_enc.shape[0] - 1)
         masks_np = masks.detach().cpu().numpy()  # [K, Hh, Wh]
