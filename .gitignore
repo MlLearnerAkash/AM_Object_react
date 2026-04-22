@@ -151,3 +151,6 @@ dmypy.json
 .pyre/
 custom_dataset
 training
+logs
+train/baseline_results
+train/val_results

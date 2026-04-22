@@ -124,8 +124,7 @@ def make_joint_val_canvas(
     pr_ov = _cost_overlay(rgb, masks_np, pr_c, alpha)
 
     fig = plt.figure(figsize=(18, 6))
-    gs  = fig.add_gridspec(2, 3, wspace=0.08, hspace=0.15,
-                           height_ratios=[1, 0.08])
+    gs  = fig.add_gridspec(1, 3, wspace=0.08, hspace=0.15)
 
     # ---- Panel 1: GT cost overlay ----------------------------------------
     ax0 = fig.add_subplot(gs[0, 0])
@@ -149,8 +148,8 @@ def make_joint_val_canvas(
     # ---- Panel 3: Top-down trajectory ------------------------------------
     ax2 = fig.add_subplot(gs[0, 2])
     # Robot frame: x = forward (plotted on Y-axis), y = left (X-axis)
-    gt_x,   gt_y   = gt_wp[:, 0],   gt_wp[:, 1]
-    pred_x, pred_y = pred_wp[:, 0], pred_wp[:, 1]
+    gt_x,   gt_y   = gt_wp[:, 0],   -gt_wp[:, 1]
+    pred_x, pred_y = pred_wp[:, 0], -pred_wp[:, 1]
 
     ax2.plot([0, *gt_y],    [0, *gt_x],   "o-",  color="#00cc44",
              lw=1.8, ms=5, label="GT traj")
@@ -171,17 +170,6 @@ def make_joint_val_canvas(
     ax2.grid(True, ls=":", alpha=0.4)
 
     # ---- Instruction text row (spans all 3 columns) ---------------------
-    if nai_text:
-        ax_txt = fig.add_subplot(gs[1, :])
-        ax_txt.axis("off")
-        # Wrap long instructions so they fit within the canvas width.
-        import textwrap
-        wrapped = textwrap.fill(nai_text, width=120)
-        ax_txt.text(0.5, 0.5, wrapped,
-                    ha="center", va="center",
-                    fontsize=20, color="black", fontweight="normal",
-                    transform=ax_txt.transAxes,
-                    wrap=True)
 
     fig.tight_layout()
     fig.canvas.draw()
@@ -191,6 +179,35 @@ def make_joint_val_canvas(
         .reshape(fh, fw, 3).copy()
     )
     plt.close(fig)
+
+    # ---- Black text strip below canvas ----------------------------------
+    if nai_text:
+        import textwrap
+        from PIL import Image as _PILImage, ImageDraw as _ImageDraw, ImageFont as _ImageFont
+
+        # Use the default PIL bitmap font — no external font file needed.
+        font = _ImageFont.load_default()
+
+        # Measure single-character width to estimate chars per line at canvas width.
+        _probe = _PILImage.new("RGB", (1, 1))
+        _d     = _ImageDraw.Draw(_probe)
+        char_w, char_h = _d.textbbox((0, 0), "W", font=font)[2:]  # right, bottom
+        chars_per_line  = max(20, (fw - 16) // max(1, char_w))
+        wrapped         = textwrap.fill(nai_text, width=chars_per_line)
+
+        # Measure the actual bounding box of the wrapped text block.
+        _bbox   = _d.textbbox((0, 0), wrapped, font=font)  # (left, top, right, bottom)
+        text_h  = _bbox[3] - _bbox[1]
+        PADDING = 8                         # px top + bottom inside the strip
+        STRIP_H = text_h + 2 * PADDING
+
+        strip = _PILImage.new("RGB", (fw, STRIP_H), (0, 0, 0))
+        draw  = _ImageDraw.Draw(strip)
+        draw.text((8, PADDING), wrapped, fill=(255, 255, 255), font=font)
+
+        strip_np   = np.array(strip)        # [STRIP_H, fw, 3] uint8
+        canvas_img = np.vstack([canvas_img, strip_np])
+
     return canvas_img
 
 

@@ -4,7 +4,7 @@
 
 # --- Run metadata ---
 project_name: joint_lang_gnm
-run_name: joint_run_v1
+run_name: joint_run_ep_inst_v1
 use_wandb: true          # set to true and configure wandb before enabling
 wandb_project: joint_lang_gnm
 
@@ -20,7 +20,8 @@ seed: 42
 # ============================================================
 
 # Path to the e3d_train_stratified.h5 (LangE3D training H5 file)
-h5_path: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/e3d_train_stratified.h5
+h5_path: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/e3d_train.h5
+#/media/opervu-user/Data2/ws/data_langgeonet_e3d_action/e3d_train_stratified.h5
 
 val_split: 0.1            # fraction of episodes held out for validation
 
@@ -50,6 +51,7 @@ mask_h: 120               # full-res mask height; half-res = 60×80 fed to GNM
 model_type: gnm
 goal_type: image_mask_enc
 obs_type: disabled
+context_type: temporal
 context_size: 5
 obs_encoding_size: 1024
 goal_encoding_size: 1024
@@ -72,7 +74,7 @@ freeze_clip: true         # partially unfreezes last 4 blocks in LangGeoNetV2.__
 freeze_dino: true         # partially unfreezes last 2 blocks
 
 # Optional: path to a pre-trained LangGeoNetV2 checkpoint.
-# lange3d_checkpoint: ./lange3dnet_train/checkpoints/best_model.pt
+lange3d_checkpoint: ./checkpoints/joint/best_joint_190426.pth
 
 # ============================================================
 # Loss weights
@@ -80,7 +82,7 @@ freeze_dino: true         # partially unfreezes last 2 blocks
 
 # LangGeoNetLoss weights
 lambda_rank: 0.5          # ordinal ranking loss weight
-lambda_si: 0.3            # scale-invariant log loss weight
+lambda_si: 0.0            # scale-invariant log loss weight
 
 # Object Grounding Contrastive Loss (OGCL)
 lambda_ogcl: 1.0          # weight of OGCL: enforces pred[referenced class] < pred[others]

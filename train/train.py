@@ -32,11 +32,14 @@ from vint_train.models.nomad.nomad_vint import NoMaD_ViNT, replace_bn_with_gn
 
 
 from vint_train.data.vint_dataset import ViNT_Dataset
+from vint_train.models.object_react.dataloader import TopoPaths
 from vint_train.training.train_eval_loop import (
     train_eval_loop,
     train_eval_loop_nomad,
     load_model,
 )
+
+from lange3dnet_train.model import LangGeoNetV2
 
 import visualize
 
@@ -45,6 +48,40 @@ import matplotlib.pyplot as plt
 
 # Turn off interactive mode
 plt.ioff()
+
+
+def _collate_with_lange3d(batch):
+    """Default-collate the first 7 ViNT outputs and pad the 8th lange3d-inputs
+    dict (which has ragged per-sample masks)."""
+    from torch.utils.data._utils.collate import default_collate
+
+    has_extra = len(batch[0]) == 8
+    main = [b[:7] for b in batch]
+    main_collated = default_collate(main)
+    if not has_extra:
+        return main_collated
+
+    extras = [b[7] for b in batch]
+    K_list = [int(e["K"]) for e in extras]
+    K_max  = max(K_list) if K_list else 0
+    Hm = extras[0]["gnm_masks"].shape[1] if extras[0]["gnm_masks"].ndim == 3 else 60
+    Wm = extras[0]["gnm_masks"].shape[2] if extras[0]["gnm_masks"].ndim == 3 else 80
+    gnm_masks_padded = torch.zeros(
+        len(batch), max(K_max, 1), Hm, Wm, dtype=torch.float32,
+    )
+    for i, e in enumerate(extras):
+        if K_list[i] > 0:
+            gnm_masks_padded[i, :K_list[i]] = e["gnm_masks"]
+
+    lang_inputs = {
+        "pixel_values_goal":  torch.stack([e["pixel_values_goal"]  for e in extras]),
+        "nai_input_ids":      torch.stack([e["nai_input_ids"]      for e in extras]),
+        "nai_attention_mask": torch.stack([e["nai_attention_mask"] for e in extras]),
+        "masks_goal_list":    [e["masks_goal"] for e in extras],
+        "gnm_masks":          gnm_masks_padded,
+        "K_list":             K_list,
+    }
+    return tuple(main_collated) + (lang_inputs,)
 
 
 def ready_dataloaders(config, data_config, dataset_name, data_split_type, **kwargs):
@@ -104,6 +141,9 @@ def ready_dataloaders(config, data_config, dataset_name, data_split_type, **kwar
     # combine all the datasets from different robots
     train_dataset = ConcatDataset(train_dataset)
 
+    use_lange3d_collate = bool(kwargs.get("return_lange3d_inputs", False))
+    collate_fn = _collate_with_lange3d if use_lange3d_collate else None
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=config["batch_size"],
@@ -111,6 +151,7 @@ def ready_dataloaders(config, data_config, dataset_name, data_split_type, **kwar
         num_workers=config["num_workers"],
         drop_last=False,
         persistent_workers=True if config["num_workers"] > 0 else False,
+        collate_fn=collate_fn,
     )
 
     if "eval_batch_size" not in config:
@@ -124,6 +165,7 @@ def ready_dataloaders(config, data_config, dataset_name, data_split_type, **kwar
             num_workers=config["eval_num_workers"],
             drop_last=False,
             persistent_workers=True if config["eval_num_workers"] > 0 else False,
+            collate_fn=collate_fn,
         )
     return train_dataset, train_loader, test_dataloaders
 
@@ -309,6 +351,15 @@ def main(config):
         "obs_type": config.get("obs_type", "image"),
         "dims": config.get("dims", None),
         "goal_uses_context": config.get("goal_uses_context", False),
+        # ----- LangGeoNetV2: when ``use_lange3d`` is true, the dataset
+        # returns the goal-frame inputs (8th tuple element) and the train
+        # loop swaps the GT-cost goal_image for the lange3d-predicted one.
+        "return_lange3d_inputs": bool(config.get("use_lange3d", False)),
+        "clip_model_name": config.get(
+            "lange3d_clip_model", "openai/clip-vit-base-patch16"
+        ),
+        "gnm_mask_h": config.get("gnm_mask_h", 60),
+        "gnm_mask_w": config.get("gnm_mask_w", 80),
     }
 
     assert config["distance"]["min_dist_cat"] < config["distance"]["max_dist_cat"]
@@ -362,6 +413,52 @@ def main(config):
     optimizer, scheduler = ready_trainer(config, model)
     current_epoch = 0
 
+    # ---- LangGeoNetV2 (predicted costs replace GT costmap as goal image) ----
+    lange3d_model = None
+    topopaths     = None
+    if config.get("use_lange3d", False):
+        print("Readying LangGeoNetV2 (predicted-cost goal image)...")
+        lange3d_model = LangGeoNetV2(
+            d_model=config.get("lange3d_d_model", 256),
+            n_heads=config.get("lange3d_n_heads", 8),
+            n_layers=config.get("lange3d_n_layers", 2),
+            clip_model_name=config.get(
+                "lange3d_clip_model", "openai/clip-vit-base-patch16"
+            ),
+            dino_model_name=config.get(
+                "lange3d_dino_model", "facebook/dinov2-small"
+            ),
+            freeze_clip=config.get("lange3d_freeze_clip", True),
+            freeze_dino=config.get("lange3d_freeze_dino", True),
+        )
+        if config.get("lange3d_checkpoint"):
+            ck = torch.load(
+                config["lange3d_checkpoint"],
+                map_location=f"cuda:{first_gpu_id}"
+                if torch.cuda.is_available() else "cpu",
+                weights_only=False,
+            )
+            state = ck.get("model_state_dict", ck)
+            miss, unexp = lange3d_model.load_state_dict(state, strict=False)
+            print(f"  loaded {config['lange3d_checkpoint']} | "
+                  f"missing={len(miss)} unexpected={len(unexp)}")
+        # Joint-train the lange3d params via the GNM loss — add them to the
+        # existing optimizer so backprop through build_differentiable_goal updates them.
+        lange3d_params = [p for p in lange3d_model.parameters() if p.requires_grad]
+        if lange3d_params:
+            optimizer.add_param_group({
+                "params": lange3d_params,
+                "lr": float(config.get("lange3d_lr", config["lr"])),
+            })
+        # Build a TopoPaths for the train loop (uses build_differentiable_goal).
+        topopaths = TopoPaths(
+            dims=config.get("dims", 8),
+            w=config.get("mask_w", 160),
+            h=config.get("mask_h", 120),
+        )
+        kwargs["lange3d_model"] = lange3d_model
+        kwargs["topopaths"]     = topopaths
+
     if "load_run" in config:
         print("Resuming model...")
         latest_checkpoint, current_epoch = resume_model(config, model)
@@ -370,6 +467,9 @@ def main(config):
     if len(config["gpu_ids"]) > 1:
         model = nn.DataParallel(model, device_ids=config["gpu_ids"])
     model = model.to(device)
+    if lange3d_model is not None:
+        lange3d_model = lange3d_model.to(device)
+        kwargs["lange3d_model"] = lange3d_model
 
     if (
         "load_run" in config and config["mode"] == "train"

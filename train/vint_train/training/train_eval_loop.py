@@ -133,7 +133,8 @@ def train_eval_loop(
             "wandb_run_dir": wandb.run.dir if use_wandb else None,
         }
         # log average eval loss
-        wandb.log({}, commit=False)
+        if use_wandb:
+            wandb.log({}, commit=False)
 
         if scheduler is not None:
             # scheduler calls based on the type of scheduler
@@ -141,13 +142,14 @@ def train_eval_loop(
                 scheduler.step(np.mean(avg_total_test_loss))
             else:
                 scheduler.step()
-        wandb.log(
-            {
-                "avg_total_test_loss": np.mean(avg_total_test_loss),
-                "lr": optimizer.param_groups[0]["lr"],
-            },
-            commit=False,
-        )
+        if use_wandb:
+            wandb.log(
+                {
+                    "avg_total_test_loss": np.mean(avg_total_test_loss),
+                    "lr": optimizer.param_groups[0]["lr"],
+                },
+                commit=False,
+            )
 
         try:
             numbered_path = os.path.join(project_folder, f"{epoch}.pth")
@@ -157,7 +159,8 @@ def train_eval_loop(
             print("Error saving model", e)
 
     # Flush the last set of eval logs
-    wandb.log({})
+    if use_wandb:
+        wandb.log({})
     print()
 
 
@@ -489,8 +492,8 @@ def train_eval_loop_joint(
                 })
                 running_loss_total = running_loss_lang = running_loss_gnm = running_loss_ogcl = 0.0
                 n_batches = 0
-            if batch_idx >2:
-                break
+            # if batch_idx >2:
+            #     break
         # LR schedulers
         if lange3d_scheduler is not None:
             lange3d_scheduler.step()
@@ -595,9 +598,9 @@ def train_eval_loop_joint(
                             "nai_text":     nai_texts[b] if b < len(nai_texts) else "",
                         })
                     viz_done = True
-                i+=1
-                if i>2:
-                    break
+                # i+=1
+                # if i>2:
+                #     break
         avg_val      = val_loss_total / max(val_n, 1)
         avg_val_lang = val_loss_lang  / max(val_n, 1)
         avg_val_ogcl = val_loss_ogcl  / max(val_n, 1)

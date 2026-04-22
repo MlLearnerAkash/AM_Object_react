@@ -59,6 +59,10 @@ seattle:
 racer:
   metric_waypoint_spacing: 0.38
 
+object_react:
+  metric_waypoint_spacing: 0.25
+  images_nameformat: "{idx}.jpg"
+
 carla_intvns:
   metric_waypoint_spacing: 1.39
 

@@ -8,8 +8,10 @@ import io
 import lmdb
 
 import torch
+import torch.nn.functional as TF_nn
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
+from PIL import Image
 
 from vint_train.data.data_utils import (
     img_path_to_data,
@@ -41,6 +43,10 @@ class ViNT_Dataset(Dataset):
         normalize: bool = True,
         obs_type: str = "image",
         goal_type: str = "image",
+        return_lange3d_inputs: bool = False,
+        clip_model_name: str = "openai/clip-vit-base-patch16",
+        gnm_mask_h: int = 60,
+        gnm_mask_w: int = 80,
         **kwargs,
     ):
         """
@@ -114,6 +120,13 @@ class ViNT_Dataset(Dataset):
         self.normalize = normalize
         self.obs_type = obs_type
         self.goal_type = goal_type
+
+        # ----- LangE3D extras -----
+        self.return_lange3d_inputs = return_lange3d_inputs
+        self.clip_model_name = clip_model_name
+        self.gnm_mask_h = gnm_mask_h
+        self.gnm_mask_w = gnm_mask_w
+        self._clip_processor = None  # lazy
 
         # load data/data_config.yaml
         with open(
@@ -346,9 +359,141 @@ class ViNT_Dataset(Dataset):
                 os.path.join(self.data_folder, trajectory_name, "traj_data.pkl"), "rb"
             ) as f:
                 traj_data = pickle.load(f)
-            traj_data = {k: v.astype(float) for k, v in traj_data.items()}
+            # Only cast ndarray values; keep strings/lists (e.g. "instruction",
+            # "gt_costs", "cat_names") as-is so the LangE3D path can use them.
+            traj_data = {
+                k: (v.astype(float) if isinstance(v, np.ndarray) else v)
+                for k, v in traj_data.items()
+            }
             self.trajectory_cache[trajectory_name] = traj_data
             return traj_data
+
+    # ------------------------------------------------------------------
+    # LangE3D goal-frame inputs (raw RGB / masks / pls / instruction)
+    # ------------------------------------------------------------------
+    def _get_clip_processor(self):
+        if self._clip_processor is None:
+            from transformers import CLIPProcessor
+            self._clip_processor = CLIPProcessor.from_pretrained(
+                self.clip_model_name
+            )
+        return self._clip_processor
+
+    def _load_lange3d_goal_inputs(self, f_goal: str, goal_time: int) -> Dict[str, Any]:
+        """
+        Returns the inputs needed to (a) run ``LangGeoNetV2`` on the goal
+        frame and (b) compute its supervised loss.
+
+        Keys:
+            pixel_values_goal  : [3, 224, 224] CLIP-preprocessed RGB
+            masks_goal         : [K, H, W] bool — full-res per-instance masks
+            gnm_masks          : [K, gnm_mask_h, gnm_mask_w] float32 — masks
+                                 resized for ``TopoPaths.build_differentiable_goal``
+            gt_costs           : [K] float32 — raw path-length costs (targets)
+            nai_input_ids      : [77] CLIP text tokens (episode instruction)
+            nai_attention_mask : [77]
+            K                  : int
+        """
+        # ---- Goal RGB → CLIP processor (native resolution) -----------
+        rgb_path = get_data_path(
+            self.data_folder, f_goal, goal_time,
+            self.images_subfolder, self.images_nameformat,
+        )
+        pil = Image.open(rgb_path).convert("RGB")
+        proc = self._get_clip_processor()
+        pixel_values_goal = proc(
+            images=pil, return_tensors="pt",
+        )["pixel_values"].squeeze(0)              # [3, 224, 224]
+
+        masks_np = np.zeros((0, 1, 1), dtype=np.uint8)
+        gt_costs = np.zeros((0,), dtype=np.float32)
+
+        precomputed = self.kwargs.get("precomputed_filename", None)
+        if precomputed is not None:
+            # ---- Masks + gt_costs from the precomputed H5 ------------
+            import h5py
+            from vint_train.models.object_react.dataloader import rle_to_mask
+            key = f"{f_goal}_{goal_time}"
+            with h5py.File(precomputed, "r") as f:
+                if key in f:
+                    kd = f[key]
+                    img_size = kd["size"][()]
+                    img_masks_grp = kd["img_masks"]
+                    K = len(img_masks_grp.keys())
+                    rles = [
+                        {"size": img_size, "counts": img_masks_grp[f"{mi}"][()]}
+                        for mi in range(K)
+                    ]
+                    if K > 0:
+                        masks_np = np.stack(
+                            [rle_to_mask(r) for r in rles], axis=0
+                        ).astype(np.uint8)          # [K, H, W]
+                    gt_costs = np.asarray(
+                        kd["img_pls"][()], dtype=np.float32
+                    )
+        else:
+            # ---- Fall back: masks/*.npz + traj_data.pkl (convert_h5_to_vint layout)
+            npz_path = os.path.join(
+                self.data_folder, f_goal, "masks", f"{goal_time}.npz",
+            )
+            if os.path.isfile(npz_path):
+                masks_np = np.load(npz_path)["masks"].astype(np.uint8)  # [K, H, W]
+            goal_td = self._get_trajectory(f_goal)
+            if (
+                isinstance(goal_td, dict)
+                and "gt_costs" in goal_td
+                and goal_time < len(goal_td["gt_costs"])
+            ):
+                gt_costs = np.asarray(
+                    goal_td["gt_costs"][goal_time], dtype=np.float32,
+                )
+                # Align K between masks and costs
+                K_m = masks_np.shape[0]
+                K_c = gt_costs.shape[0]
+                if K_m != K_c:
+                    K_eff = min(K_m, K_c)
+                    masks_np = masks_np[:K_eff]
+                    gt_costs = gt_costs[:K_eff]
+
+        K = masks_np.shape[0]
+        # Resize masks to GNM goal-encoder grid for build_differentiable_goal
+        if K == 0:
+            gnm_masks = np.zeros(
+                (0, self.gnm_mask_h, self.gnm_mask_w), dtype=np.float32
+            )
+        else:
+            t = torch.from_numpy(masks_np).unsqueeze(0).float()
+            t = TF_nn.interpolate(
+                t, size=(self.gnm_mask_h, self.gnm_mask_w), mode="nearest",
+            )
+            gnm_masks = t.squeeze(0).numpy()
+
+        # ---- Instruction → CLIP text tokens --------------------------
+        goal_td = self._get_trajectory(f_goal)
+        instruction = goal_td.get("instruction", "") if isinstance(goal_td, dict) else ""
+        if not isinstance(instruction, str):
+            try:
+                instruction = instruction.decode("utf-8")
+            except Exception:
+                instruction = str(instruction)
+        if not instruction:
+            instruction = "navigate"
+        nai = proc(
+            text=instruction,
+            padding="max_length", truncation=True,
+            max_length=77, return_tensors="pt",
+        )
+
+        return {
+            "pixel_values_goal":  pixel_values_goal,
+            "masks_goal":         torch.from_numpy(masks_np).bool(),
+            "gnm_masks":          torch.from_numpy(gnm_masks),
+            "gt_costs":           torch.from_numpy(gt_costs),
+            "nai_input_ids":      nai["input_ids"].squeeze(0),
+            "nai_attention_mask": nai["attention_mask"].squeeze(0),
+            "instruction":        instruction,
+            "K":                  K,
+        }
 
     def __len__(self) -> int:
         return len(self.index_to_data)
@@ -404,27 +549,35 @@ class ViNT_Dataset(Dataset):
 
         # Load goal image
         if self.goal_type == "image_mask_enc":
-            if self.kwargs["goal_uses_context"]:
-                goal_context = context
+            if self.return_lange3d_inputs:
+                # Goal will be replaced at runtime by LangGeoNetV2 prediction;
+                # return a zero placeholder of the correct shape [3+dims, mh, mw].
+                dims = self.kwargs.get("dims", 8)
+                mh = self.kwargs.get("gnm_mask_h", 60)
+                mw = self.kwargs.get("gnm_mask_w", 80)
+                goal_image = np.zeros((3 + dims, mh, mw), dtype=np.float32)
             else:
-                goal_context = [(f_curr, curr_time)]
-            goal_image_list, goal_vis_list = [], []
-            for f, t in goal_context:
-                goal_image, goal_vis = self.topopaths.get_topo_path(f, t)
-                goal_image_list.append(goal_image)
-                goal_vis_list.append(goal_vis)
-            goal_image = np.concatenate(goal_image_list, 0)
-            goal_image = np.concatenate([goal_vis_list[-1], goal_image], axis=0)
-            if goal_image.dtype == object:
-                # print("Error: goal_image is object")
-                # TODO: remove hard coded shape
-                goal_image = np.concatenate(
-                    [
-                        np.zeros((3, 60, 80)),
-                        np.ones((self.kwargs["dims_segFt"], 60, 80)),
-                    ],
-                    axis=0,
-                )
+                if self.kwargs["goal_uses_context"]:
+                    goal_context = context
+                else:
+                    goal_context = [(f_curr, curr_time)]
+                goal_image_list, goal_vis_list = [], []
+                for f, t in goal_context:
+                    goal_image, goal_vis = self.topopaths.get_topo_path(f, t)
+                    goal_image_list.append(goal_image)
+                    goal_vis_list.append(goal_vis)
+                goal_image = np.concatenate(goal_image_list, 0)
+                goal_image = np.concatenate([goal_vis_list[-1], goal_image], axis=0)
+                if goal_image.dtype == object:
+                    # print("Error: goal_image is object")
+                    # TODO: remove hard coded shape
+                    goal_image = np.concatenate(
+                        [
+                            np.zeros((3, 60, 80)),
+                            np.ones((self.kwargs["dims_segFt"], 60, 80)),
+                        ],
+                        axis=0,
+                    )
         elif self.goal_type == "image":
             goal_image = self._load_image(f_goal, goal_time)
         elif self.goal_type == "disabled":
@@ -461,7 +614,7 @@ class ViNT_Dataset(Dataset):
             and (not goal_is_negative)
         )
 
-        return (
+        out = (
             torch.as_tensor(obs_image, dtype=torch.float32),
             torch.as_tensor(goal_image, dtype=torch.float32),
             actions_torch,
@@ -470,3 +623,6 @@ class ViNT_Dataset(Dataset):
             torch.as_tensor(self.dataset_index, dtype=torch.int64),
             torch.as_tensor(action_mask, dtype=torch.float32),
         )
+        if self.return_lange3d_inputs:
+            out = out + (self._load_lange3d_goal_inputs(f_curr, curr_time),) # goal_time
+        return out

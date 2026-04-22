@@ -128,6 +128,40 @@ def get_obs_image(obs_image, obs_type, transform, device):
     return obs_image, viz_obs_image
 
 
+def _maybe_predict_goal_with_lange3d(
+    data, goal_image, device, lange3d_model, topopaths,
+):
+    """
+    If a LangGeoNetV2 model is provided and the dataset returned the
+    goal-frame inputs (8th element), replace ``goal_image`` with a
+    differentiable goal encoding built from the *predicted* costs.
+
+    Returns ``(goal_image, was_replaced)``.
+    - ``was_replaced=True``  : goal_image is now ``[B, 3+dims, mh, mw]``;
+                               caller should treat it as ``image_mask_enc``.
+    - ``was_replaced=False`` : original goal_image tensor unchanged.
+    """
+    if lange3d_model is None or topopaths is None or len(data) < 8:
+        return goal_image, False
+
+    lang_inputs = data[7]
+    pixel_values = lang_inputs["pixel_values_goal"].to(device)
+    masks_list   = [m.to(device) for m in lang_inputs["masks_goal_list"]]
+    nai_ids      = lang_inputs["nai_input_ids"].to(device)
+    nai_attn     = lang_inputs["nai_attention_mask"].to(device)
+    gnm_masks    = lang_inputs["gnm_masks"].to(device)
+    K_list       = lang_inputs["K_list"]
+
+    pred_logits, _ = lange3d_model(
+        pixel_values, masks_list, nai_ids, nai_attn,
+    )
+    # [B, 3 + dims, mh, mw] — chans 0–2 are detached viz; rest is differentiable.
+    goal_enc = topopaths.build_differentiable_goal(
+        pred_logits, gnm_masks, K_list, device=device,
+    )
+    return goal_enc, True
+
+
 def get_goal_image(goal_image, goal_type, transform, device, obs_image=None):
     viz_goal_image = TF.resize(goal_image, VISUALIZATION_IMAGE_SIZE)
 
@@ -299,6 +333,9 @@ def train(
         dynamic_ncols=True,
         desc=f"Training epoch {epoch}",
     )
+    lange3d_model = kwargs.get("lange3d_model", None)
+    topopaths     = kwargs.get("topopaths", None)
+
     for i, data in enumerate(tqdm_iter):
         (
             obs_image,
@@ -308,12 +345,17 @@ def train(
             goal_pos,
             dataset_index,
             action_mask,
-        ) = data
+        ) = data[:7]
 
         obs_image, viz_obs_image = get_obs_image(obs_image, obs_type, transform, device)
 
+        # Replace goal_image with LangGeoNetV2 prediction-derived encoding.
+        goal_image, goal_was_replaced = _maybe_predict_goal_with_lange3d(
+            data, goal_image, device, lange3d_model, topopaths,
+        )
+        eff_goal_type = "image_mask_enc" if goal_was_replaced else goal_type
         goal_image, viz_goal_image = get_goal_image(
-            goal_image, goal_type, transform, device, obs_image
+            goal_image, eff_goal_type, transform, device, obs_image
         )
 
         model_outputs = model(obs_image, goal_image)
@@ -444,6 +486,8 @@ def evaluate(
             dynamic_ncols=True,
             desc=f"Evaluating {eval_type} for epoch {epoch}",
         )
+        lange3d_model = kwargs.get("lange3d_model", None)
+        topopaths     = kwargs.get("topopaths", None)
         for i, data in enumerate(tqdm_iter):
             (
                 obs_image,
@@ -453,15 +497,19 @@ def evaluate(
                 goal_pos,
                 dataset_index,
                 action_mask,
-            ) = data
+            ) = data[:7]
 
             obs_image, viz_obs_image = get_obs_image(
                 obs_image, obs_type, transform, device
             )
 
             viz_goal_image = TF.resize(goal_image, VISUALIZATION_IMAGE_SIZE)
+            goal_image, goal_was_replaced = _maybe_predict_goal_with_lange3d(
+                data, goal_image, device, lange3d_model, topopaths,
+            )
+            eff_goal_type = "image_mask_enc" if goal_was_replaced else goal_type
             goal_image, viz_goal_image = get_goal_image(
-                goal_image, goal_type, transform, device, obs_image
+                goal_image, eff_goal_type, transform, device, obs_image
             )
 
             model_outputs = model(obs_image, goal_image)

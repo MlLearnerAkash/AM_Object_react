@@ -72,8 +72,8 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Defaults — must match joint_train.py / joint_val_app.py
 # ---------------------------------------------------------------------------
-DEFAULT_CHECKPOINT = os.path.join(_SCRIPT_DIR, "checkpoints/joint/best_joint_180426.pth")
-DEFAULT_H5         = "/media/opervu-user/Data2/ws/data_langgeonet_e3d_action/e3d_train_stratified.h5"
+DEFAULT_CHECKPOINT = os.path.join(_SCRIPT_DIR, "checkpoints/joint/latest.pth")
+DEFAULT_H5         = "/media/opervu-user/Data2/ws/data_langgeonet_e3d_action/e3d_test.h5"
 DEFAULT_VAL_SPLIT  = 0.1
 DEFAULT_SEED       = 42
 DEFAULT_OUT_DIR    = os.path.join(_SCRIPT_DIR, "val_results")

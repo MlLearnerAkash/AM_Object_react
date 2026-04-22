@@ -101,6 +101,17 @@ def build_lange3d(cfg: dict, device: torch.device) -> LangGeoNetV2:
         freeze_clip=cfg.get("freeze_clip", True),
         freeze_dino=cfg.get("freeze_dino", True),
     ).to(device)
+
+    # Freeze cost/ranking heads so gradients only flow through the backbone.
+    for mod_name in ("cost_head", "rank_refine", "rank_head"):
+        mod = getattr(model, mod_name, None)
+        if mod is not None:
+            for p in mod.parameters():
+                p.requires_grad = False
+            print(f"[LangGeoNetV2] frozen: {mod_name}")
+        else:
+            print(f"[LangGeoNetV2] warning: module '{mod_name}' not found — skipping freeze")
+
     return model
 
 
@@ -109,6 +120,7 @@ def load_lange3d_checkpoint(
 ) -> LangGeoNetV2:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     state = ckpt.get("model_state_dict", ckpt)
+
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:
         print(f"[LangE3D checkpoint] missing keys: {missing[:5]} …")
