@@ -262,7 +262,7 @@ class LangGeoNetLoss(nn.Module):
               +  lambda_aux  * (L_reg_geo + L_ordinal_geo)   (auxiliary on cost_head)
     """
 
-    def __init__(self, lambda_rank=0.5, lambda_si=0.3, lambda_aux=0.5,
+    def __init__(self, lambda_rank=0.5, lambda_si=0.0, lambda_aux=0.5,
                  lambda_div=0.5):
         super().__init__()
         self.lambda_rank = lambda_rank

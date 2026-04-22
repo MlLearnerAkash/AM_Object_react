@@ -40,6 +40,7 @@ from vint_train.training.train_eval_loop import (
 )
 
 from lange3dnet_train.model import LangGeoNetV2
+from lange3dnet_train.losses import LangGeoNetLoss
 
 import visualize
 
@@ -80,6 +81,7 @@ def _collate_with_lange3d(batch):
         "masks_goal_list":    [e["masks_goal"] for e in extras],
         "gnm_masks":          gnm_masks_padded,
         "K_list":             K_list,
+        "gt_costs_list":      [e["gt_costs"] for e in extras],
     }
     return tuple(main_collated) + (lang_inputs,)
 
@@ -456,8 +458,18 @@ def main(config):
             w=config.get("mask_w", 160),
             h=config.get("mask_h", 120),
         )
-        kwargs["lange3d_model"] = lange3d_model
-        kwargs["topopaths"]     = topopaths
+        # Build the supervised cost-predictor loss and expose it to the train loop.
+        lange3d_loss = LangGeoNetLoss(
+            lambda_rank=float(config.get("lange3d_lambda_rank", 1.0)),
+            lambda_si=float(config.get("lange3d_lambda_si", 1.0)),
+        )
+        lange3d_loss = lange3d_loss.to(
+            f"cuda:{first_gpu_id}" if torch.cuda.is_available() else "cpu"
+        )
+        kwargs["lange3d_model"]  = lange3d_model
+        kwargs["topopaths"]      = topopaths
+        kwargs["lange3d_loss_fn"] = lange3d_loss
+        kwargs["lambda_lange3d"] = float(config.get("lambda_lange3d", 1.0))
 
     if "load_run" in config:
         print("Resuming model...")
@@ -470,6 +482,8 @@ def main(config):
     if lange3d_model is not None:
         lange3d_model = lange3d_model.to(device)
         kwargs["lange3d_model"] = lange3d_model
+        if "lange3d_loss_fn" in kwargs:
+            kwargs["lange3d_loss_fn"] = kwargs["lange3d_loss_fn"].to(device)
 
     if (
         "load_run" in config and config["mode"] == "train"
