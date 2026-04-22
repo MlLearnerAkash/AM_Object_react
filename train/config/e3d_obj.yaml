@@ -1,0 +1,98 @@
+
+project_name: e3d_object_react
+run_name: joint_train
+
+# KEY PARAMS
+mode: train
+predict_dists: True
+goal_type: "image_mask_enc"
+obs_type: "disabled"
+dims: 8
+goal_uses_context: False
+
+# Joint LangGeoNetV2 training: replace GT costmap goal with predicted one
+use_lange3d: True
+lange3d_clip_model: "openai/clip-vit-base-patch16"
+lange3d_dino_model: "facebook/dinov2-small"
+lange3d_d_model: 256
+lange3d_n_heads: 8
+lange3d_n_layers: 2
+lange3d_freeze_clip: True
+lange3d_freeze_dino: True
+lange3d_lr: 3.0e-4
+gnm_mask_h: 60
+gnm_mask_w: 80
+mask_h: 120
+mask_w: 160
+
+# training setup
+use_wandb: False
+batch_size: 4
+eval_batch_size: 4
+epochs: 30
+gpu_ids: [0]
+num_workers: 0
+eval_num_workers: 0
+lr: 3e-4
+optimizer: adamw
+seed: 42
+
+# model params
+model_type: gnm
+obs_encoding_size: 1024
+goal_encoding_size: 1024
+
+# normalization
+normalize: True
+
+# context
+context_type: temporal
+context_size: 5
+
+# tradeoff between action and distance prediction loss
+alpha: 0.5
+
+# distance bounds
+distance:
+  min_dist_cat: 0
+  max_dist_cat: 20
+action:
+  min_dist_cat: 2
+  max_dist_cat: 10
+close_far_threshold: 10
+
+# action output params
+len_traj_pred: 5
+learn_angle: True
+
+# dataset
+image_size: [85, 64]
+
+# TopoPaths / LangGeoNetV2 kwargs (forwarded via **kwargs)
+pl_perturb_ratio: 0.0
+pl_perturb_type: max_val
+mask_crop_ratio: 1.0
+use_mask_grad: False
+
+# NO separate precomputed_filename: _load_lange3d_goal_inputs reads masks
+# directly from the traj masks/*.npz written by convert_h5_to_vint.py.
+precomputed_filename: null
+
+datasets:
+  object_react:
+    data_folder: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/vint_format/
+    train: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/splits/train/
+    test: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/splits/test/
+    end_slack: 3
+    goals_per_obs: 1
+    negative_mining: True
+    waypoint_spacing: 1
+    images_nameformat: "{idx}.jpg"
+
+# logging
+print_log_freq: 5
+image_log_freq: 10
+num_images_log: 4
+wandb_log_freq: 10
+eval_fraction: 1.0
+eval_freq: 1
