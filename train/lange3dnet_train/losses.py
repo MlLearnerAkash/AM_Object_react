@@ -28,9 +28,18 @@ class GeodesicRegressionLoss(nn.Module):
         for pred, gt in zip(predictions, targets):
             if pred.numel() == 0:
                 continue
+            # Min-max normalise GT to [0, 1] so sentinel values (e.g. 1e6 for
+            # unreachable objects stored in raw traj_data.pkl) do not explode
+            # the regression target.  The normalised sentinel maps to 1.0,
+            # correctly representing the highest-cost object.
+            g_min, g_max = gt.min(), gt.max()
+            if (g_max - g_min).abs() > 1e-8:
+                gt_norm = (gt - g_min) / (g_max - g_min)
+            else:
+                gt_norm = torch.zeros_like(gt)
             # Predictions are raw logits; apply sigmoid before regression.
             total_loss += F.smooth_l1_loss(
-                torch.sigmoid(pred), gt, beta=self.beta, reduction='sum')
+                torch.sigmoid(pred), gt_norm, beta=self.beta, reduction='sum')
             total_objects += pred.numel()
 
         if total_objects == 0:
@@ -58,9 +67,24 @@ class OrdinalRankingLoss(nn.Module):
             if K < 2:
                 continue
 
-            # Pairwise differences
-            pred_diff = pred.unsqueeze(1) - pred.unsqueeze(0)   # [K,K]: pred_i - pred_j
-            gt_diff = gt.unsqueeze(1) - gt.unsqueeze(0)         # [K,K]: gt_i - gt_j
+            # Min-max normalise predictions to [0, 1] so pairwise differences
+            # are bounded and the loss scale is comparable to the GT scale.
+            p_min, p_max = pred.min(), pred.max()
+            if (p_max - p_min).abs() > 1e-8:
+                pred_norm = (pred - p_min) / (p_max - p_min)
+            else:
+                pred_norm = torch.zeros_like(pred)
+
+            # GT is already min-max normalised [0, 1] by the dataset.
+            g_min, g_max = gt.min(), gt.max()
+            if (g_max - g_min).abs() > 1e-8:
+                gt_norm = (gt - g_min) / (g_max - g_min)
+            else:
+                gt_norm = torch.zeros_like(gt)
+
+            # Pairwise differences on normalised values
+            pred_diff = pred_norm.unsqueeze(1) - pred_norm.unsqueeze(0)   # [K,K]: pred_i - pred_j
+            gt_diff = gt_norm.unsqueeze(1) - gt_norm.unsqueeze(0)         # [K,K]: gt_i - gt_j
             valid = (gt_diff < -1e-6)  # gt_i < gt_j -> pred_i should be < pred_j
 
             if valid.sum() == 0:
@@ -107,9 +131,16 @@ class ScaleInvariantLogLoss(nn.Module):
             if pred.numel() == 0:
                 continue
 
+            # Min-max normalise GT to [0, 1] to guard against sentinel values.
+            g_min, g_max = gt.min(), gt.max()
+            if (g_max - g_min).abs() > 1e-8:
+                gt_norm = (gt - g_min) / (g_max - g_min)
+            else:
+                gt_norm = torch.zeros_like(gt)
+
             # Predictions are raw logits; apply sigmoid before log-space loss.
             log_pred = torch.log(torch.sigmoid(pred).clamp(min=self.eps))
-            log_gt = torch.log(gt.clamp(min=self.eps))
+            log_gt = torch.log(gt_norm.clamp(min=self.eps))
             diff = log_pred - log_gt
 
             total_loss += (diff ** 2).mean() - self.lam * (diff.mean()) ** 2
@@ -162,9 +193,25 @@ class ListNetRankingLoss(nn.Module):
             K = pred.shape[0]
             if K < 2:
                 continue
+
+            # Min-max normalise predictions to [0, 1] before computing
+            # log-softmax so scale is consistent with the GT distribution.
+            p_min, p_max = pred.min(), pred.max()
+            if (p_max - p_min).abs() > 1e-8:
+                pred_norm = (pred - p_min) / (p_max - p_min)
+            else:
+                pred_norm = torch.zeros_like(pred)
+
+            # GT already in [0, 1]; normalise defensively.
+            g_min, g_max = gt.min(), gt.max()
+            if (g_max - g_min).abs() > 1e-8:
+                gt_norm = (gt - g_min) / (g_max - g_min)
+            else:
+                gt_norm = torch.zeros_like(gt)
+
             # Invert costs so lower-cost objects get higher probability mass.
-            true_probs = F.softmax(-gt,   dim=0)   # [K]
-            pred_log   = F.log_softmax(pred, dim=0) # [K]
+            true_probs = F.softmax(-gt_norm,    dim=0)   # [K]
+            pred_log   = F.log_softmax(pred_norm, dim=0) # [K]
             total_loss -= (true_probs * pred_log).sum()
             count += 1
 

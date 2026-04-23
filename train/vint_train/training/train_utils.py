@@ -401,6 +401,8 @@ def train(
         desc=f"Training epoch {epoch}",
     )
     lange3d_model = kwargs.get("lange3d_model", None)
+    if lange3d_model is not None:
+        lange3d_model.train()
     topopaths     = kwargs.get("topopaths", None)
     lange3d_loss_fn = kwargs.get("lange3d_loss_fn", None)
     lambda_lange3d  = float(kwargs.get("lambda_lange3d", 1.0))
@@ -459,6 +461,11 @@ def train(
             losses["total_loss"] = losses["total_loss"] + lambda_lange3d * l_lang
 
         losses["total_loss"].backward()
+        #To save it from sudden spike
+        torch.nn.utils.clip_grad_norm_(
+            [p for g in optimizer.param_groups for p in g["params"] if p.grad is not None],
+            max_norm=kwargs.get("clip_grad_norm", 1.0),
+        )
         optimizer.step()
 
         for key, value in losses.items():
@@ -528,6 +535,9 @@ def evaluate(
         use_tqdm (bool): whether to use tqdm for logging
     """
     model.eval()
+    lange3d_model = kwargs.get("lange3d_model", None)
+    if lange3d_model is not None:
+        lange3d_model.eval()
     goal_type = kwargs.get("goal_type", "image")
     obs_type = kwargs.get("obs_type", "image")
     dist_loss_logger = Logger("dist_loss", eval_type)
@@ -569,7 +579,6 @@ def evaluate(
             dynamic_ncols=True,
             desc=f"Evaluating {eval_type} for epoch {epoch}",
         )
-        lange3d_model = kwargs.get("lange3d_model", None)
         topopaths     = kwargs.get("topopaths", None)
         lange3d_loss_fn = kwargs.get("lange3d_loss_fn", None)
         lambda_lange3d  = float(kwargs.get("lambda_lange3d", 1.0))

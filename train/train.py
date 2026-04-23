@@ -353,15 +353,15 @@ def main(config):
         "obs_type": config.get("obs_type", "image"),
         "dims": config.get("dims", None),
         "goal_uses_context": config.get("goal_uses_context", False),
-        # ----- LangGeoNetV2: when ``use_lange3d`` is true, the dataset
         # returns the goal-frame inputs (8th tuple element) and the train
-        # loop swaps the GT-cost goal_image for the lange3d-predicted one.
         "return_lange3d_inputs": bool(config.get("use_lange3d", False)),
         "clip_model_name": config.get(
             "lange3d_clip_model", "openai/clip-vit-base-patch16"
         ),
         "gnm_mask_h": config.get("gnm_mask_h", 60),
         "gnm_mask_w": config.get("gnm_mask_w", 80),
+        "clip_grad_norm": config.get("clip_grad_norm", 1.0),
+        "max_traj_len":   config.get("max_traj_len", None),
     }
 
     assert config["distance"]["min_dist_cat"] < config["distance"]["max_dist_cat"]
@@ -460,8 +460,8 @@ def main(config):
         )
         # Build the supervised cost-predictor loss and expose it to the train loop.
         lange3d_loss = LangGeoNetLoss(
-            lambda_rank=float(config.get("lange3d_lambda_rank", 1.0)),
-            lambda_si=float(config.get("lange3d_lambda_si", 1.0)),
+            lambda_rank=float(config.get("lange3d_lambda_rank", 0.3)),
+            lambda_si=float(config.get("lange3d_lambda_si", 0.0)),
         )
         lange3d_loss = lange3d_loss.to(
             f"cuda:{first_gpu_id}" if torch.cuda.is_available() else "cpu"
@@ -469,7 +469,7 @@ def main(config):
         kwargs["lange3d_model"]  = lange3d_model
         kwargs["topopaths"]      = topopaths
         kwargs["lange3d_loss_fn"] = lange3d_loss
-        kwargs["lambda_lange3d"] = float(config.get("lambda_lange3d", 1.0))
+        kwargs["lambda_lange3d"] = float(config.get("lambda_lange3d", 0.1))
 
     if "load_run" in config:
         print("Resuming model...")

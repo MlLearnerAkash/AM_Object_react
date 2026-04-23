@@ -74,6 +74,8 @@ class ViNT_Dataset(Dataset):
         self.dataset_name = dataset_name
         self.kwargs = kwargs
 
+        self.max_traj_len= self.kwargs["max_traj_len"]
+
         traj_names_file = os.path.join(data_split_folder, "traj_names.txt")
         with open(traj_names_file, "r") as f:
             file_lines = f.read()
@@ -212,18 +214,23 @@ class ViNT_Dataset(Dataset):
         # Reopen the cache file in read-only mode
         self._image_cache: lmdb.Environment = lmdb.open(cache_filename, readonly=True)
 
-    def _build_index(self, use_tqdm: bool = False):
+    def _build_index(self, use_tqdm: bool = False ):
         """
         Build an index consisting of tuples (trajectory name, time, max goal distance)
         """
         samples_index = []
         goals_index = []
+        skipped = 0
 
         for traj_name in tqdm.tqdm(
             self.traj_names, disable=not use_tqdm, dynamic_ncols=True
         ):
             traj_data = self._get_trajectory(traj_name)
             traj_len = len(traj_data["position"])
+
+            if self.max_traj_len is not None and traj_len > self.max_traj_len:
+                skipped += 1
+                continue
 
             for goal_time in range(0, traj_len):
                 goals_index.append((traj_name, goal_time))
@@ -237,7 +244,9 @@ class ViNT_Dataset(Dataset):
                     self.max_dist_cat * self.waypoint_spacing, traj_len - curr_time - 1
                 )
                 samples_index.append((traj_name, curr_time, max_goal_distance))
-
+                
+        if self.max_traj_len is not None:
+            print(f"Skipped {skipped} trajectories longer than {self.max_traj_len} steps")
         return samples_index, goals_index
 
     def _sample_goal(self, trajectory_name, curr_time, max_goal_dist):
