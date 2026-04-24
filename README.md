@@ -51,3 +51,11 @@ Please refer to the [object-rel-nav](https://github.com/oravus/object-rel-nav) r
   organization={PMLR}
 }
 ```
+
+----------------------
+## Two ways to Traini it:
+### Joint Train:
+  joint_train.py -c configs/joint_training.yaml(Current dataset format supports episodic instruction)
+
+### with conventional training:
+  python train.py -c config/e3d_obj.yaml
