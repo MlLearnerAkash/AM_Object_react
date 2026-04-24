@@ -1,3 +1,8 @@
+# This repo has standalone Object React Train, End to End LangGeoNet+ObjectReact training and E2E Evaluation
+
+<details>
+  <summary> Bunch of old stuff </summary>
+
 # ObjectReact: Learning Object-Relative Control for Visual Navigation [CoRL 2025]
 
 This repository is based on [GNM](https://github.com/robodhruv/visualnav-transformer) for training an object-relative controller, dubbed [ObjectReact](https://object-react.github.io/).
@@ -51,16 +56,30 @@ Please refer to the [object-rel-nav](https://github.com/oravus/object-rel-nav) r
   organization={PMLR}
 }
 ```
+</details>
 
 ----------------------
 ## Two ways to Traini it:
-### Joint Train:
+### Joint Train from h5 path:
+```bash
   joint_train.py -c configs/joint_training.yaml(Current dataset format supports episodic instruction)
+```
 
 ### with conventional training:
+Convert HDF5 to objectreact training format -> train E2E
+```bash
   python train.py -c config/e3d_obj.yaml
-
+```
 
 
 ## Installation (WARNING: Bot a baby's job)
+> ⚠️ **Note:** This repo uses nested submodules. Use `--recursive` to clone everything.
+
+```bash
 git clone https://github.com/MlLearnerAkash/AM_Object_react.git --recursive
+```
+
+If you already cloned without `--recursive`:
+```bash
+git submodule update --init --recursive
+```
