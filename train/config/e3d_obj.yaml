@@ -19,11 +19,14 @@ lange3d_n_heads: 8
 lange3d_n_layers: 2
 lange3d_freeze_clip: True
 lange3d_freeze_dino: True
-lange3d_lr: 3.0e-4
+# lange3d_lr: 3.0e-4
 gnm_mask_h: 60
 gnm_mask_w: 80
 mask_h: 120
 mask_w: 160
+lange3d_lr_head: 3.0e-4 #-4
+lange3d_lr_backbone: 1.0e-5 #-5
+lange3d_lambda_rank: 0.5
 
 # training setup
 use_wandb: True
@@ -53,7 +56,7 @@ context_size: 5
 alpha: 0.5
 
 # distance bounds
-lambda_lange3d: 0.1
+lambda_lange3d: 1.0
 clip_grad_norm: 1.0
 
 distance:
@@ -102,3 +105,4 @@ eval_freq: 1
 
 #filtering
 max_traj_len: 100
+filter_dead_samples: True #len(mask)> 2 and mask.std()> 1e-6

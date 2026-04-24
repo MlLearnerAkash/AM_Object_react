@@ -136,17 +136,18 @@ def _maybe_predict_goal_with_lange3d(
     goal-frame inputs (8th element), replace ``goal_image`` with a
     differentiable goal encoding built from the *predicted* costs.
 
-    Returns ``(goal_image, was_replaced, pred_logits)``.
+    Returns ``(goal_image, was_replaced, pred_logits, geo_preds)``.
     - ``was_replaced=True``  : goal_image is now ``[B, 3+dims, mh, mw]``;
                                caller should treat it as ``image_mask_enc``.
     - ``was_replaced=False`` : original goal_image tensor unchanged.
     ``pred_logits`` is the raw per-object cost logits returned by LangGeoNetV2
-    (or ``None`` when the model is not active).  Callers can pass it to
-    ``lange3d_loss_fn(pred_logits, gt_costs_list)`` to get the cost-predictor
-    supervised loss and add it to the total backward pass.
+    (or ``None`` when the model is not active).
+    ``geo_preds`` is the pre-refinement raw logits from ``cost_head`` and is
+    forwarded to ``LangGeoNetLoss`` to enable the auxiliary supervision
+    branch (``lambda_aux``).
     """
     if lange3d_model is None or topopaths is None or len(data) < 8:
-        return goal_image, False, None
+        return goal_image, False, None, None
 
     lang_inputs = data[7]
     pixel_values = lang_inputs["pixel_values_goal"].to(device)
@@ -156,14 +157,15 @@ def _maybe_predict_goal_with_lange3d(
     gnm_masks    = lang_inputs["gnm_masks"].to(device)
     K_list       = lang_inputs["K_list"]
 
-    pred_logits, _ = lange3d_model(
+    pred_logits, geo_preds, _ = lange3d_model(
         pixel_values, masks_list, nai_ids, nai_attn,
+        return_geo=True,
     )
     # [B, 3 + dims, mh, mw] — chans 0–2 are detached viz; rest is differentiable.
     goal_enc = topopaths.build_differentiable_goal(
         pred_logits, gnm_masks, K_list, device=device,
     )
-    return goal_enc, True, pred_logits
+    return goal_enc, True, pred_logits, geo_preds
 
 
 def get_goal_image(goal_image, goal_type, transform, device, obs_image=None):
@@ -188,7 +190,21 @@ def _compute_lange3d_cost_metrics(
     lang_preds_list: list,
     gt_costs_list: list,
 ) -> dict:
-    gt_concat, pred_concat = [], []
+    """Per-sample averaged ranking metrics.
+
+    Both spearman_rho and ranking_acc are computed *within each sample* and
+    then averaged across samples. This matches what the loss optimizes
+    (per-sample min-max normalised ranking) and avoids the cross-sample
+    pollution caused by concatenating per-sample-normalised predictions
+    against raw multi-scale GT (which makes the global metric essentially
+    random even when within-frame ranking is perfect).
+    """
+    try:
+        from scipy.stats import spearmanr as _spearmanr
+    except Exception:
+        _spearmanr = None
+
+    spearman_per_sample = []
     pair_accs = []
 
     for pred, gt in zip(lang_preds_list, gt_costs_list):
@@ -203,41 +219,37 @@ def _compute_lange3d_cost_metrics(
         pred_np = pred_np[:K]
         gt_np   = gt_np[:K]
 
-        rng = pred_np.max() - pred_np.min()
-        pred_norm = (pred_np - pred_np.min()) / (rng + 1e-8)
+        # Per-sample spearman: requires K>=3 for a meaningful correlation
+        # and >0 GT variance (otherwise rank is undefined).
+        if K >= 3 and gt_np.std() > 1e-8 and _spearmanr is not None:
+            try:
+                result = _spearmanr(pred_np, gt_np)
+                rho = float(
+                    getattr(result, "statistic", None)
+                    if getattr(result, "statistic", None) is not None
+                    else getattr(result, "correlation", float("nan"))
+                )
+                if not np.isnan(rho):
+                    spearman_per_sample.append(rho)
+            except Exception:
+                pass
 
-        if gt_np.std() > 1e-8:
-            gt_concat.append(gt_np)
-            pred_concat.append(pred_norm)
-
-        # Pairwise ranking accuracy: fraction of (i,j) pairs ordered correctly
+        # Per-sample pairwise ranking accuracy
         n_correct, n_pairs = 0, 0
         for i in range(K):
             for j in range(i + 1, K):
                 if abs(gt_np[i] - gt_np[j]) < 1e-8:
-                    continue                          # tied GT — skip
+                    continue
                 n_pairs += 1
                 if (pred_np[i] - pred_np[j]) * (gt_np[i] - gt_np[j]) > 0:
                     n_correct += 1
         if n_pairs > 0:
             pair_accs.append(n_correct / n_pairs)
 
-    spearman_rho = float("nan")
-    if gt_concat:
-        try:
-            from scipy.stats import spearmanr as _spearmanr
-            gt_flat   = np.concatenate(gt_concat)
-            pred_flat = np.concatenate(pred_concat)
-            if len(gt_flat) > 2:
-                result = _spearmanr(gt_flat, pred_flat)
-                # scipy ≥1.9 uses .statistic; older uses .correlation
-                spearman_rho = float(
-                    getattr(result, "statistic", None)
-                    or getattr(result, "correlation", float("nan"))
-                )
-        except Exception:
-            pass
-
+    spearman_rho = (
+        float(np.mean(spearman_per_sample))
+        if spearman_per_sample else float("nan")
+    )
     ranking_acc = float(np.mean(pair_accs)) if pair_accs else float("nan")
     return {
         "lange3d_spearman_rho": spearman_rho,
@@ -374,6 +386,11 @@ def train(
     )
     total_loss_logger = Logger("total_loss", "train", window_size=print_log_freq)
     lange3d_loss_logger = Logger("lange3d_loss", "train", window_size=print_log_freq)
+    lange3d_reg_logger  = Logger("lange3d_reg",  "train", window_size=print_log_freq)
+    lange3d_rank_logger = Logger("lange3d_rank", "train", window_size=print_log_freq)
+    lange3d_list_logger = Logger("lange3d_list", "train", window_size=print_log_freq)
+    lange3d_aux_logger  = Logger("lange3d_aux",  "train", window_size=print_log_freq)
+    lange3d_div_logger  = Logger("lange3d_div",  "train", window_size=print_log_freq)
     loggers = {
         "dist_loss": dist_loss_logger,
         "action_loss": action_loss_logger,
@@ -381,6 +398,11 @@ def train(
         "multi_action_waypts_cos_sim": multi_action_waypts_cos_sim_logger,
         "total_loss": total_loss_logger,
         "lange3d_loss": lange3d_loss_logger,
+        "lange3d_reg":  lange3d_reg_logger,
+        "lange3d_rank": lange3d_rank_logger,
+        "lange3d_list": lange3d_list_logger,
+        "lange3d_aux":  lange3d_aux_logger,
+        "lange3d_div":  lange3d_div_logger,
     }
 
     if learn_angle:
@@ -420,10 +442,10 @@ def train(
 
         obs_image, viz_obs_image = get_obs_image(obs_image, obs_type, transform, device)
 
-        # Replace goal_image with LangGeoNetV2 prediction-derived encoding.
-        # pred_logits is returned so we can supervise the cost predictor directly.
-        goal_image, goal_was_replaced, lang_preds = _maybe_predict_goal_with_lange3d(
-            data, goal_image, device, lange3d_model, topopaths,
+        goal_image, goal_was_replaced, lang_preds, lang_geo_preds = (
+            _maybe_predict_goal_with_lange3d(
+                data, goal_image, device, lange3d_model, topopaths,
+            )
         )
         eff_goal_type = "image_mask_enc" if goal_was_replaced else goal_type
         goal_image, viz_goal_image = get_goal_image(
@@ -456,16 +478,41 @@ def train(
         if lang_preds is not None and lange3d_loss_fn is not None:
             lang_inputs = data[7]
             gt_costs_list = [c.to(device) for c in lang_inputs["gt_costs_list"]]
-            l_lang, _ = lange3d_loss_fn(lang_preds, gt_costs_list)
+            l_lang, lang_loss_dict = lange3d_loss_fn(lang_preds, gt_costs_list, geo_preds=lang_geo_preds)
             losses["lange3d_loss"] = l_lang
             losses["total_loss"] = losses["total_loss"] + lambda_lange3d * l_lang
+            # Per-component scalars (floats already) for visibility.
+            for k, lname in [
+                ("loss_regression", "lange3d_reg"),
+                ("loss_ranking",    "lange3d_rank"),
+                ("loss_listnet",    "lange3d_list"),
+                ("loss_aux_geo",    "lange3d_aux"),
+                ("loss_diversity",  "lange3d_div"),
+            ]:
+                if k in lang_loss_dict and lname in loggers:
+                    loggers[lname].log_data(float(lang_loss_dict[k]))
 
         losses["total_loss"].backward()
         #To save it from sudden spike
-        torch.nn.utils.clip_grad_norm_(
-            [p for g in optimizer.param_groups for p in g["params"] if p.grad is not None],
-            max_norm=kwargs.get("clip_grad_norm", 1.0),
-        )
+        # torch.nn.utils.clip_grad_norm_(
+        #     [p for g in optimizer.param_groups for p in g["params"] if p.grad is not None],
+        #     max_norm=kwargs.get("clip_grad_norm", 1.0),
+        # )
+        _gnm_params = [
+            p for g in optimizer.param_groups
+            if not g.get("is_lange3d", False)
+            for p in g["params"] if p.grad is not None
+        ]
+        _l3d_params = [
+            p for g in optimizer.param_groups
+            if g.get("is_lange3d", False)
+            for p in g["params"] if p.grad is not None
+        ]
+        clip_norm = kwargs.get("clip_grad_norm", 1.0)
+        if _gnm_params:
+            torch.nn.utils.clip_grad_norm_(_gnm_params, max_norm=clip_norm)
+        if _l3d_params:
+            torch.nn.utils.clip_grad_norm_(_l3d_params, max_norm=clip_norm)
         optimizer.step()
 
         for key, value in losses.items():
@@ -548,6 +595,11 @@ def evaluate(
     )
     total_loss_logger = Logger("total_loss", eval_type)
     lange3d_loss_logger = Logger("lange3d_loss", eval_type)
+    lange3d_reg_logger  = Logger("lange3d_reg",  eval_type)
+    lange3d_rank_logger = Logger("lange3d_rank", eval_type)
+    lange3d_list_logger = Logger("lange3d_list", eval_type)
+    lange3d_aux_logger  = Logger("lange3d_aux",  eval_type)
+    lange3d_div_logger  = Logger("lange3d_div",  eval_type)
     loggers = {
         "dist_loss": dist_loss_logger,
         "action_loss": action_loss_logger,
@@ -555,6 +607,11 @@ def evaluate(
         "multi_action_waypts_cos_sim": multi_action_waypts_cos_sim_logger,
         "total_loss": total_loss_logger,
         "lange3d_loss": lange3d_loss_logger,
+        "lange3d_reg":  lange3d_reg_logger,
+        "lange3d_rank": lange3d_rank_logger,
+        "lange3d_list": lange3d_list_logger,
+        "lange3d_aux":  lange3d_aux_logger,
+        "lange3d_div":  lange3d_div_logger,
     }
 
     if learn_angle:
@@ -598,8 +655,10 @@ def evaluate(
             )
 
             viz_goal_image = TF.resize(goal_image, VISUALIZATION_IMAGE_SIZE)
-            goal_image, goal_was_replaced, lang_preds = _maybe_predict_goal_with_lange3d(
-                data, goal_image, device, lange3d_model, topopaths,
+            goal_image, goal_was_replaced, lang_preds, lang_geo_preds = (
+                _maybe_predict_goal_with_lange3d(
+                    data, goal_image, device, lange3d_model, topopaths,
+                )
             )
             eff_goal_type = "image_mask_enc" if goal_was_replaced else goal_type
             goal_image, viz_goal_image = get_goal_image(
@@ -627,9 +686,18 @@ def evaluate(
             if lang_preds is not None and lange3d_loss_fn is not None:
                 lang_inputs = data[7]
                 gt_costs_list = [c.to(device) for c in lang_inputs["gt_costs_list"]]
-                l_lang, _ = lange3d_loss_fn(lang_preds, gt_costs_list)
+                l_lang, lang_loss_dict = lange3d_loss_fn(lang_preds, gt_costs_list, geo_preds=lang_geo_preds)
                 losses["lange3d_loss"] = l_lang
                 losses["total_loss"] = losses["total_loss"] + lambda_lange3d * l_lang
+                for k, lname in [
+                    ("loss_regression", "lange3d_reg"),
+                    ("loss_ranking",    "lange3d_rank"),
+                    ("loss_listnet",    "lange3d_list"),
+                    ("loss_aux_geo",    "lange3d_aux"),
+                    ("loss_diversity",  "lange3d_div"),
+                ]:
+                    if k in lang_loss_dict and lname in loggers:
+                        loggers[lname].log_data(float(lang_loss_dict[k]))
                 # Accumulate for end-of-epoch Spearman / ranking-accuracy
                 _all_lang_preds.extend(lang_preds)
                 _all_gt_costs.extend(gt_costs_list)

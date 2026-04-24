@@ -362,6 +362,7 @@ def main(config):
         "gnm_mask_w": config.get("gnm_mask_w", 80),
         "clip_grad_norm": config.get("clip_grad_norm", 1.0),
         "max_traj_len":   config.get("max_traj_len", None),
+        "filter_dead_samples": config.get("filter_dead_samples", False),
     }
 
     assert config["distance"]["min_dist_cat"] < config["distance"]["max_dist_cat"]
@@ -444,14 +445,27 @@ def main(config):
             miss, unexp = lange3d_model.load_state_dict(state, strict=False)
             print(f"  loaded {config['lange3d_checkpoint']} | "
                   f"missing={len(miss)} unexpected={len(unexp)}")
-        # Joint-train the lange3d params via the GNM loss — add them to the
-        # existing optimizer so backprop through build_differentiable_goal updates them.
-        lange3d_params = [p for p in lange3d_model.parameters() if p.requires_grad]
-        if lange3d_params:
-            optimizer.add_param_group({
-                "params": lange3d_params,
-                "lr": float(config.get("lange3d_lr", config["lr"])),
-            })
+        #Applying different learning rate
+        head_params, backbone_params = [], []
+        for n, p in lange3d_model.named_parameters():
+            if not p.requires_grad:
+                continue
+            is_backbone = n.startswith("clip.") or n.startswith("dino.")
+            (backbone_params if is_backbone else head_params).append(p)
+        lr_head = float(config.get(
+            "lange3d_lr_head", config.get("lange3d_lr_head", config["lange3d_lr_head"])
+        ))
+        lr_bb   = float(config.get("lange3d_lr_backbone", lr_head * 0.1))
+        if head_params:
+            optimizer.add_param_group({"params": head_params, "lr": lr_head, "is_lange3d": True})
+        if backbone_params:
+            optimizer.add_param_group({"params": backbone_params, "lr": lr_bb, "is_lange3d": True})
+        print(
+            f"  lange3d optimizer groups: head={len(head_params)} "
+            f"params @ lr={lr_head:.1e}, backbone={len(backbone_params)} "
+            f"params @ lr={lr_bb:.1e}"
+        )
+        
         # Build a TopoPaths for the train loop (uses build_differentiable_goal).
         topopaths = TopoPaths(
             dims=config.get("dims", 8),

@@ -75,6 +75,12 @@ class ViNT_Dataset(Dataset):
         self.kwargs = kwargs
 
         self.max_traj_len= self.kwargs["max_traj_len"]
+        # When True, drop (traj, goal_time) pairs whose gt_costs vector is
+        # "dead" (K<2 or std<1e-6 — e.g. all zeros, all sentinel 1e6).  Such
+        # samples contribute zero ranking signal and are excluded from the
+        # spearman/ranking metrics anyway.
+        self.filter_dead_samples = bool(self.kwargs.get("filter_dead_samples", False))
+        self._alive_times: Dict[str, np.ndarray] = {}
 
         traj_names_file = os.path.join(data_split_folder, "traj_names.txt")
         with open(traj_names_file, "r") as f:
@@ -222,6 +228,9 @@ class ViNT_Dataset(Dataset):
         goals_index = []
         skipped = 0
 
+        n_goals_alive = 0
+        n_goals_total = 0
+
         for traj_name in tqdm.tqdm(
             self.traj_names, disable=not use_tqdm, dynamic_ncols=True
         ):
@@ -232,7 +241,16 @@ class ViNT_Dataset(Dataset):
                 skipped += 1
                 continue
 
+            if self.filter_dead_samples:
+                alive = self._compute_alive_times(traj_name)
+            else:
+                alive = None
+
             for goal_time in range(0, traj_len):
+                n_goals_total += 1
+                if alive is not None and not (goal_time < alive.shape[0] and alive[goal_time]):
+                    continue
+                n_goals_alive += 1
                 goals_index.append((traj_name, goal_time))
 
             begin_time = self.context_size * self.waypoint_spacing
@@ -244,9 +262,17 @@ class ViNT_Dataset(Dataset):
                     self.max_dist_cat * self.waypoint_spacing, traj_len - curr_time - 1
                 )
                 samples_index.append((traj_name, curr_time, max_goal_distance))
-                
+        #filtering samples with repeated steps        
         if self.max_traj_len is not None:
             print(f"Skipped {skipped} trajectories longer than {self.max_traj_len} steps")
+        if self.filter_dead_samples and n_goals_total > 0:
+            kept = n_goals_alive / n_goals_total
+            print(
+                f"filter_dead_samples=True: kept {n_goals_alive}/{n_goals_total} "
+                f"goal frames ({100*kept:.1f}% alive); "
+                f"dropped {n_goals_total - n_goals_alive} dead frames "
+                f"(K<2 or std<=1e-6)"
+            )
         return samples_index, goals_index
 
     def _sample_goal(self, trajectory_name, curr_time, max_goal_dist):
@@ -260,6 +286,17 @@ class ViNT_Dataset(Dataset):
             return trajectory_name, goal_time, True
         else:
             goal_time = curr_time + int(goal_offset * self.waypoint_spacing)
+            if self.filter_dead_samples:
+                # Try a few re-samples within the future window to land on an
+                # alive frame; otherwise fall back to a negative.
+                for _ in range(8):
+                    if self._is_alive(trajectory_name, goal_time):
+                        return trajectory_name, goal_time, False
+                    off = np.random.randint(1, max_goal_dist + 1)
+                    goal_time = curr_time + int(off * self.waypoint_spacing)
+                if not self._is_alive(trajectory_name, goal_time):
+                    trajectory_name, goal_time = self._sample_negative()
+                    return trajectory_name, goal_time, True
             return trajectory_name, goal_time, False
 
     def _sample_negative(self):
@@ -268,13 +305,49 @@ class ViNT_Dataset(Dataset):
         """
         return self.goals_index[np.random.randint(0, len(self.goals_index))]
 
+    def _compute_alive_times(self, traj_name: str) -> np.ndarray:
+        """Return per-timestep bool array marking frames with usable gt_costs.
+
+        A frame is "alive" if its gt_costs vector has K>=2 objects AND
+        std(gt_costs) > 1e-6 (i.e. not all-zeros and not all-sentinel).
+        Frames without gt_costs are marked dead.
+        """
+        if traj_name in self._alive_times:
+            return self._alive_times[traj_name]
+        td = self._get_trajectory(traj_name)
+        T = len(td["position"]) if isinstance(td, dict) and "position" in td else 0
+        alive = np.zeros(T, dtype=bool)
+        if isinstance(td, dict) and "gt_costs" in td:
+            gtc = td["gt_costs"]
+            for t in range(T):
+                try:
+                    arr = np.asarray(gtc[t], dtype=np.float32) if t < len(gtc) else None
+                except Exception:
+                    arr = None
+                if arr is None or arr.size < 2:
+                    continue
+                if float(arr.std()) > 1e-6:
+                    alive[t] = True
+        self._alive_times[traj_name] = alive
+        return alive
+
+    def _is_alive(self, traj_name: str, t: int) -> bool:
+        alive = self._compute_alive_times(traj_name)
+        return 0 <= t < alive.shape[0] and bool(alive[t])
+
     def _load_index(self) -> None:
         """
         Generates a list of tuples of (obs_traj_name, goal_traj_name, obs_time, goal_time) for each observation in the dataset
         """
+        suffix_maxlen = (
+            f"_maxlen{self.max_traj_len}" if self.max_traj_len is not None else ""
+        )
+        suffix_alive = "_aliveonly" if self.filter_dead_samples else ""
         index_to_data_path = os.path.join(
             self.data_split_folder,
-            f"dataset_dist_{self.min_dist_cat}_to_{self.max_dist_cat}_context_{self.context_type}_n{self.context_size}_slack_{self.end_slack}.pkl",
+            f"dataset_dist_{self.min_dist_cat}_to_{self.max_dist_cat}"
+            f"_context_{self.context_type}_n{self.context_size}"
+            f"_slack_{self.end_slack}{suffix_maxlen}{suffix_alive}.pkl",
         )
         try:
             # load the index_to_data if it already exists (to save time)
