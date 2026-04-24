@@ -1,0 +1,100 @@
+# Smoke-test variant of e3d_obj.yaml:
+# - filter_dead_samples=True drops gt_costs vectors with K<2 or std<=1e-6
+#   (~26% of frames in the original dataset profile).
+# - LangGeoNetLoss now also receives geo_preds (return_geo=True wired in
+#   _maybe_predict_goal_with_lange3d), enabling lambda_aux on cost_head.
+# - 10 epochs only, single dataset, no wandb, otherwise identical to e3d_obj.
+
+project_name: e3d_object_react_smoke
+run_name: smoke_filter_dead_returngeo
+
+mode: train
+predict_dists: True
+goal_type: "image_mask_enc"
+obs_type: "disabled"
+dims: 8
+goal_uses_context: False
+
+use_lange3d: True
+lange3d_clip_model: "openai/clip-vit-base-patch16"
+lange3d_dino_model: "facebook/dinov2-small"
+lange3d_d_model: 256
+lange3d_n_heads: 8
+lange3d_n_layers: 2
+lange3d_freeze_clip: True
+lange3d_freeze_dino: True
+# Two LR groups for the lange3d branch — matches the standalone trainer recipe
+# that converged to rho>=0.85.  Joining everything at lr_head was destroying
+# the (still-trainable) last-4 CLIP + last-2 DINO blocks the cross-attention
+# depends on (rho was monotonically degrading epoch over epoch).
+lange3d_lr_head: 1.0e-4       # cross-modal transformer, projections, cost_head, rank_head
+lange3d_lr_backbone: 1.0e-5   # last-4 CLIP vision/text + last-2 DINO blocks
+lange3d_lambda_rank: 0.5      # was 0.3 — match the overfit-test combo (rho 0.89 in 200 steps)
+gnm_mask_h: 60
+gnm_mask_w: 80
+mask_h: 120
+mask_w: 160
+
+use_wandb: False
+batch_size: 32
+eval_batch_size: 16
+epochs: 10
+gpu_ids: [0]
+num_workers: 0
+eval_num_workers: 0
+lr: 3e-4
+optimizer: adamw
+seed: 42
+
+model_type: gnm
+obs_encoding_size: 1024
+goal_encoding_size: 1024
+
+normalize: True
+context_type: temporal
+context_size: 5
+alpha: 0.5
+
+lambda_lange3d: 1.0   # was 0.1 — bring lange3d into the same order of magnitude as action/dist losses
+clip_grad_norm: 1.0   # tighter global clip is OK now that backbones are 10x slower
+
+distance:
+  min_dist_cat: 0
+  max_dist_cat: 20
+action:
+  min_dist_cat: 2
+  max_dist_cat: 20
+close_far_threshold: 10
+
+len_traj_pred: 10
+learn_angle: True
+
+image_size: [85, 64]
+
+pl_perturb_ratio: 0.0
+pl_perturb_type: max_val
+mask_crop_ratio: 1.0
+use_mask_grad: False
+precomputed_filename: null
+
+datasets:
+  object_react:
+    data_folder: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/vint_format/
+    train: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/splits/train/
+    test: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/splits/test/
+    end_slack: 3
+    goals_per_obs: 1
+    negative_mining: True
+    waypoint_spacing: 1
+    images_nameformat: "{idx}.jpg"
+
+print_log_freq: 5
+image_log_freq: 50
+num_images_log: 4
+wandb_log_freq: 50
+eval_fraction: 1.0
+eval_freq: 1
+
+# filtering
+max_traj_len: 100
+filter_dead_samples: True
