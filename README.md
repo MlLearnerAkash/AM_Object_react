@@ -59,3 +59,8 @@ Please refer to the [object-rel-nav](https://github.com/oravus/object-rel-nav) r
 
 ### with conventional training:
   python train.py -c config/e3d_obj.yaml
+
+
+
+## Installation (WARNING: Bot a baby's job)
+git clone https://github.com/MlLearnerAkash/AM_Object_react.git --recursive
