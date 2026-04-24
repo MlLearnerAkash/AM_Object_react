@@ -1,5 +1,8 @@
 # This repo has standalone Object React Train, End to End LangGeoNet+ObjectReact training and E2E Evaluation
 
+## latest Update posted at 
+[VLA/N updates](https://docs.google.com/presentation/d/1ANNVi8VlF5EPDUPScFRQj9DACdMsC1iOaSL7NPmH24A/edit?usp=sharing)
+
 <details>
   <summary> Bunch of old stuff </summary>
 
@@ -59,17 +62,7 @@ Please refer to the [object-rel-nav](https://github.com/oravus/object-rel-nav) r
 </details>
 
 ----------------------
-## Two ways to Traini it:
-### Joint Train from h5 path:
-```bash
-  joint_train.py -c configs/joint_training.yaml(Current dataset format supports episodic instruction)
-```
 
-### with conventional training:
-Convert HDF5 to objectreact training format -> train E2E
-```bash
-  python train.py -c config/e3d_obj.yaml
-```
 
 
 ## Installation (WARNING: Bot a baby's job)
@@ -82,4 +75,22 @@ git clone https://github.com/MlLearnerAkash/AM_Object_react.git --recursive
 If you already cloned without `--recursive`:
 ```bash
 git submodule update --init --recursive
+```
+
+## Two ways to Traini it:
+### Joint Train from h5 path:
+```bash
+  joint_train.py -c configs/joint_training.yaml(Current dataset format supports episodic instruction)
+```
+
+### with conventional training:
+Convert HDF5 to objectreact training format -> train E2E
+```bash
+  python train.py -c config/e3d_obj.yaml
+```
+
+### Evaluate
+Evaluate on MP3D 
+```bash
+  python eval/main.py -c configs/lang_mp3d.yaml
 ```
