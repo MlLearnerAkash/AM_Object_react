@@ -639,7 +639,9 @@ def evaluate(
         topopaths     = kwargs.get("topopaths", None)
         lange3d_loss_fn = kwargs.get("lange3d_loss_fn", None)
         lambda_lange3d  = float(kwargs.get("lambda_lange3d", 1.0))
+        print(">>>>>>>>>")
         for i, data in enumerate(tqdm_iter):
+            
             (
                 obs_image,
                 goal_image,

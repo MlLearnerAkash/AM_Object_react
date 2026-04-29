@@ -258,6 +258,8 @@ class ViNT_Dataset(Dataset):
                 traj_len - self.end_slack - self.len_traj_pred * self.waypoint_spacing
             )
             for curr_time in range(begin_time, end_time):
+                if alive is not None and not (curr_time < alive.shape[0] and alive[curr_time]):
+                    continue
                 max_goal_distance = min(
                     self.max_dist_cat * self.waypoint_spacing, traj_len - curr_time - 1
                 )
