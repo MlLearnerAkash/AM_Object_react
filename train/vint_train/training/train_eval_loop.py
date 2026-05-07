@@ -158,13 +158,26 @@ def train_eval_loop(
             _lange3d = kwargs.get("lange3d_model", None)
             if _lange3d is not None:
                 joint_latest_path = os.path.join(project_folder, "joint_latest.pth")
-                torch.save({
+                # torch.save({
+                #     "epoch": epoch,
+                #     "gnm": model.state_dict(),
+                #     "lange3d": _lange3d.state_dict(),
+                #     "optimizer": optimizer.state_dict(),
+                #     "avg_total_test_loss": np.mean(avg_total_test_loss),
+                # }, joint_latest_path)
+                checkpoint = {
                     "epoch": epoch,
                     "gnm": model.state_dict(),
                     "lange3d": _lange3d.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "avg_total_test_loss": np.mean(avg_total_test_loss),
-                }, joint_latest_path)
+                }
+                if epoch % 50 == 0:
+                    joint_epoch_path = os.path.join(project_folder, f"joint_{epoch}.pth")
+                    torch.save(checkpoint, joint_epoch_path)
+                
+                torch.save(checkpoint, joint_latest_path)
+
         except Exception as e:
             print("Error saving model", e)
 
