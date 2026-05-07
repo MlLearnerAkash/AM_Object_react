@@ -141,11 +141,10 @@ class TopoPaths:
         dims = self.rank_enc.shape[1]
         near_enc = torch.tensor(
             self.rank_enc[0], dtype=torch.float32, device=device
-        )  # [dims] — low path-length reference vector
+        )
         far_enc = torch.tensor(
             self.rank_enc[-1], dtype=torch.float32, device=device
-        )  # [dims] — high path-length reference vector
-
+        )
         results = []
         for b, (logits, K) in enumerate(zip(lang_pred_list, K_list)):
             masks_b = gnm_masks[b, :K].to(device)   # [K, Hh, Wh]
@@ -157,29 +156,25 @@ class TopoPaths:
                 results.append(torch.cat([viz, img_enc], dim=0))
                 continue
 
-            # Min-max normalise raw logits → full [0,1] range for blend weights
             lo = logits.min()
             costs = (logits - lo) / (logits.max() - lo + 1e-8)  # [K] ∈ [0,1]
-            # Soft blend of near_enc and far_enc per object:
             #   enc_k = (1 - cost_k) * near_enc + cost_k * far_enc   [K, dims]
-            weights_near = (1.0 - costs).unsqueeze(1)   # [K, 1]
-            weights_far  = costs.unsqueeze(1)            # [K, 1]
-            obj_enc = weights_near * near_enc + weights_far * far_enc  # [K, dims]
+            weights_near = (1.0 - costs).unsqueeze(1)
+            weights_far  = costs.unsqueeze(1)
+            obj_enc = weights_near * near_enc + weights_far * far_enc
 
-            # Accumulate over masks: sum_k mask_k * enc_k → [dims, Hh, Wh]
-            # einsum('kd, khw -> dhw')
-            img_enc = torch.einsum("kd,khw->dhw", obj_enc, masks_b)  # [dims, Hh, Wh]
+            img_enc = torch.einsum("kd,khw->dhw", obj_enc, masks_b)
 
             # Detached visualisation (winter-like: near=blue, far=red).
             costs_d = costs.detach()
             r_ch = (masks_b * costs_d[:, None, None]).sum(0).clamp(0, 1)
             g_ch = (masks_b * (1.0 - costs_d)[:, None, None]).sum(0).clamp(0, 1)
             b_ch = torch.zeros_like(r_ch)
-            viz = torch.stack([r_ch, g_ch, b_ch], dim=0).detach()  # [3, Hh, Wh]
+            viz = torch.stack([r_ch, g_ch, b_ch], dim=0).detach()
 
-            results.append(torch.cat([viz, img_enc], dim=0))  # [3+dims, Hh, Wh]
+            results.append(torch.cat([viz, img_enc], dim=0))
 
-        return torch.stack(results, dim=0)  # [B, 3+dims, Hh, Wh]
+        return torch.stack(results, dim=0)
 
     def create_input_from_predictions(
         self,
