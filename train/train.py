@@ -412,6 +412,26 @@ def main(config):
     print("Readying model...")
     model, noise_scheduler = ready_model(config, **kwargs)
 
+    # ---- Pre-trained GNM checkpoint (weights for linear layers + action head) ----
+    if config.get("gnm_pretrained_checkpoint") and config["model_type"] == "gnm":
+        ckpt_path = config["gnm_pretrained_checkpoint"]
+        print(f"Loading pre-trained GNM from {ckpt_path} ...")
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        if "model" in ckpt:
+            state = ckpt["model"]
+            if hasattr(state, "state_dict"):
+                state = state.state_dict()
+        elif "model_state_dict" in ckpt:
+            state = ckpt["model_state_dict"]
+        else:
+            state = ckpt
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing:
+            print(f"  [GNM pretrain] missing keys ({len(missing)}): {missing[:5]}...")
+        if unexpected:
+            print(f"  [GNM pretrain] unexpected keys ({len(unexpected)}): {unexpected[:5]}...")
+        print(f"  [GNM pretrain] loaded {len(state) - len(unexpected)}/{len(state)} keys")
+
     print("Readying trainer...")
     optimizer, scheduler = ready_trainer(config, model)
     current_epoch = 0
