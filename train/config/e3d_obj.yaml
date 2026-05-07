@@ -32,7 +32,7 @@ lange3d_lambda_rank: 0.5
 use_wandb: True
 batch_size: 32
 eval_batch_size: 16
-epochs: 100
+epochs: 10
 gpu_ids: [0]
 num_workers: 0
 eval_num_workers: 0
@@ -80,15 +80,17 @@ pl_perturb_type: max_val
 mask_crop_ratio: 1.0
 use_mask_grad: False
 
-# NO separate precomputed_filename: _load_lange3d_goal_inputs reads masks
-# directly from the traj masks/*.npz written by convert_h5_to_vint.py.
 precomputed_filename: null
+
+#Pretrained models: optional
+gnm_pretrained_checkpoint: /home/opervu-user/.cache/huggingface/hub/models--oravus--ObjectReact/snapshots/69cba7a90197edef8cbe051fe2524015d8f4f4d5/latest.pth
+lange3d_checkpoint: /data/ws/VLN-CE/controller/object_react/train/checkpoints/joint/best_joint.pth
 
 datasets:
   object_react:
-    data_folder: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/vint_format/
-    train: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/splits/train/
-    test: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/splits/test/
+    data_folder: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/vint_format_rxr_ep454 #/media/opervu-user/Data2/ws/data_langgeonet_e3d_action/vint_format/
+    train: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/vint_format_ep454/vint_format/train #/media/opervu-user/Data2/ws/data_langgeonet_e3d_action/splits/train/
+    test: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/vint_format_ep454/vint_format/test #/media/opervu-user/Data2/ws/data_langgeonet_e3d_action/splits/test/
     end_slack: 3
     goals_per_obs: 1
     negative_mining: True
