@@ -639,9 +639,7 @@ def evaluate(
         topopaths     = kwargs.get("topopaths", None)
         lange3d_loss_fn = kwargs.get("lange3d_loss_fn", None)
         lambda_lange3d  = float(kwargs.get("lambda_lange3d", 1.0))
-        print(">>>>>>>>>")
         for i, data in enumerate(tqdm_iter):
-            
             (
                 obs_image,
                 goal_image,
@@ -656,16 +654,21 @@ def evaluate(
                 obs_image, obs_type, transform, device
             )
 
-            viz_goal_image = TF.resize(goal_image, VISUALIZATION_IMAGE_SIZE)
             goal_image, goal_was_replaced, lang_preds, lang_geo_preds = (
                 _maybe_predict_goal_with_lange3d(
                     data, goal_image, device, lange3d_model, topopaths,
                 )
             )
-            eff_goal_type = "image_mask_enc" if goal_was_replaced else goal_type
-            goal_image, viz_goal_image = get_goal_image(
-                goal_image, eff_goal_type, transform, device, obs_image
-            )
+            if goal_was_replaced:
+                viz_goal_image, goal_image = goal_image.split(
+                    [3, goal_image.shape[1] - 3], dim=1
+                )
+                goal_image = goal_image.to(device)
+                viz_goal_image = TF.resize(viz_goal_image, VISUALIZATION_IMAGE_SIZE)
+            else:
+                goal_image, viz_goal_image = get_goal_image(
+                    goal_image, goal_type, transform, device, obs_image
+                )
 
             model_outputs = model(obs_image, goal_image)
 
