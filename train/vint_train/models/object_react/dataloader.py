@@ -60,6 +60,8 @@ class TopoPaths:
 
     def get_topo_path(self, trajName, imgIdx):
         key = f"{trajName}_{imgIdx}"
+        if self.precomputed_filename is None:
+            return self.create_input(None, None)
         with h5py.File(self.precomputed_filename, "r") as masks_pls_dict:
             if key not in masks_pls_dict:
                 return self.create_input(None, None)

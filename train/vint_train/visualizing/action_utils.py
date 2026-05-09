@@ -40,6 +40,7 @@ def visualize_traj_pred(
     num_images_preds: int = 8,
     use_wandb: bool = True,
     display: bool = False,
+    start_idx: int = 0,
 ):
     """
     Compare predicted path with the gt path of waypoints using egocentric visualization. This visualization is for the last batch in the dataset.
@@ -58,6 +59,8 @@ def visualize_traj_pred(
         num_images_preds (int): number of images to visualize
         use_wandb (bool): whether to use wandb to log the images
         display (bool): whether to display the images
+        start_idx (int): global sample index offset for unique filenames
+                          across multiple batches (e.g. batch_idx * batch_size).
     """
     visualize_path = None
     if save_folder is not None:
@@ -96,7 +99,8 @@ def visualize_traj_pred(
 
         save_path = None
         if visualize_path is not None:
-            save_path = os.path.join(visualize_path, f"{str(i).zfill(4)}.png")
+            global_idx = start_idx + i
+            save_path = os.path.join(visualize_path, f"{str(global_idx).zfill(6)}.png")
 
         compare_waypoints_pred_to_label(
             obs_img,

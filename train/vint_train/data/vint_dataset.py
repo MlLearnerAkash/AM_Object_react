@@ -282,7 +282,10 @@ class ViNT_Dataset(Dataset):
         Sample a goal from the future in the same trajectory.
         Returns: (trajectory_name, goal_time, goal_is_negative)
         """
-        goal_offset = np.random.randint(0, max_goal_dist + 1)
+        # When eval_negatives is False, always use a positive offset ≥ 1
+        # (useful during evaluation to avoid negative samples from other trajs).
+        offset_low = 0 if self.kwargs.get("eval_negatives", True) else 1
+        goal_offset = np.random.randint(offset_low, max_goal_dist + 1)
         if goal_offset == 0:
             trajectory_name, goal_time = self._sample_negative()
             return trajectory_name, goal_time, True
@@ -408,6 +411,15 @@ class ViNT_Dataset(Dataset):
 
         waypoints = to_local_coords(positions, positions[0], yaw[0])
         goal_pos = to_local_coords(goal_pos, positions[0], yaw[0])
+
+        # HM3D → Habitat coordinate fix.
+        # The pretrained model's action_predictor bias is entirely positive
+        # for dx (rightward), so it cannot predict negative X (leftward).
+        # HM3D data has +X = left; Habitat has +X = right.  Flipping X
+        # aligns the data's left/right convention with the model's bias.
+        if self.kwargs.get("hm3d_to_habitat", False):
+            waypoints[:, 0] = -waypoints[:, 0]
+            goal_pos[0] = -goal_pos[0]
 
         assert waypoints.shape == (
             self.len_traj_pred + 1,

@@ -132,40 +132,55 @@ def _maybe_predict_goal_with_lange3d(
     data, goal_image, device, lange3d_model, topopaths,
 ):
     """
-    If a LangGeoNetV2 model is provided and the dataset returned the
-    goal-frame inputs (8th element), replace ``goal_image`` with a
-    differentiable goal encoding built from the *predicted* costs.
+    Build a goal encoding from the 8th dataset element (goal-frame inputs).
 
-    Returns ``(goal_image, was_replaced, pred_logits, geo_preds)``.
+    Two modes:
+      * **Predicted** (``lange3d_model is not None``):
+          Run LangGeoNetV2 on the goal frame to predict per-object costs.
+      * **GT** (``lange3d_model is None`` but ``topopaths is not None`` and
+        ``len(data) >= 8``):
+          Use the ground-truth costs stored in the dataset directly
+          (``data[7]["gt_costs_list"]``).
+
+    Returns ``(goal_image, was_replaced, cost_logits, geo_preds)``.
     - ``was_replaced=True``  : goal_image is now ``[B, 3+dims, mh, mw]``;
                                caller should treat it as ``image_mask_enc``.
     - ``was_replaced=False`` : original goal_image tensor unchanged.
-    ``pred_logits`` is the raw per-object cost logits returned by LangGeoNetV2
-    (or ``None`` when the model is not active).
-    ``geo_preds`` is the pre-refinement raw logits from ``cost_head`` and is
-    forwarded to ``LangGeoNetLoss`` to enable the auxiliary supervision
-    branch (``lambda_aux``).
+    ``cost_logits`` is the tensor of costs used for the goal encoding
+    (predicted logits from LangGeoNetV2 *or* GT costs from the dataset,
+    depending on the mode).  ``None`` when the function is inactive.
+    ``geo_preds`` is ``None`` in GT mode.
     """
-    if lange3d_model is None or topopaths is None or len(data) < 8:
+    if topopaths is None or len(data) < 8:
         return goal_image, False, None, None
 
     lang_inputs = data[7]
-    pixel_values = lang_inputs["pixel_values_goal"].to(device)
-    masks_list   = [m.to(device) for m in lang_inputs["masks_goal_list"]]
-    nai_ids      = lang_inputs["nai_input_ids"].to(device)
-    nai_attn     = lang_inputs["nai_attention_mask"].to(device)
     gnm_masks    = lang_inputs["gnm_masks"].to(device)
     K_list       = lang_inputs["K_list"]
 
-    pred_logits, geo_preds, _ = lange3d_model(
-        pixel_values, masks_list, nai_ids, nai_attn,
-        return_geo=True,
-    )
+    if lange3d_model is not None:
+        # ---- Predicted mode: run LangGeoNetV2 ----------------------------
+        pixel_values = lang_inputs["pixel_values_goal"].to(device)
+        masks_list   = [m.to(device) for m in lang_inputs["masks_goal_list"]]
+        nai_ids      = lang_inputs["nai_input_ids"].to(device)
+        nai_attn     = lang_inputs["nai_attention_mask"].to(device)
+
+        cost_logits, geo_preds, _ = lange3d_model(
+            pixel_values, masks_list, nai_ids, nai_attn,
+            return_geo=True,
+        )
+    else:
+        # ---- GT mode: use ground-truth costs from the dataset ------------
+        cost_logits = []
+        for c in lang_inputs["gt_costs_list"]:
+            cost_logits.append(c.to(device))
+        geo_preds = None
+
     # [B, 3 + dims, mh, mw] — chans 0–2 are detached viz; rest is differentiable.
     goal_enc = topopaths.build_differentiable_goal(
-        pred_logits, gnm_masks, K_list, device=device,
+        cost_logits, gnm_masks, K_list, device=device,
     )
-    return goal_enc, True, pred_logits, geo_preds
+    return goal_enc, True, cost_logits, geo_preds
 
 
 def get_goal_image(goal_image, goal_type, transform, device, obs_image=None):
@@ -628,6 +643,7 @@ def evaluate(
     viz_obs_image = None
     _all_lang_preds: list = []
     _all_gt_costs:   list = []
+    _viz_sample_counter = 0  # global counter for unique filenames
     with torch.no_grad():
         tqdm_iter = tqdm.tqdm(
             itertools.islice(dataloader, num_batches),
@@ -712,6 +728,26 @@ def evaluate(
                     logger = loggers[key]
                     logger.log_data(value.item())
 
+            # ---- Per-batch visualisation (every sample, unique filenames) ----
+            if eval_type != "train":
+                per_batch = kwargs.get("viz_images_per_batch", num_images_log)
+                visualize_traj_pred(
+                    to_numpy(viz_obs_image),
+                    to_numpy(viz_goal_image),
+                    to_numpy(dataset_index),
+                    to_numpy(goal_pos),
+                    to_numpy(action_pred),
+                    to_numpy(action_label),
+                    eval_type,
+                    normalized,
+                    project_folder,
+                    epoch,
+                    num_images_preds=per_batch,
+                    use_wandb=False,
+                    start_idx=_viz_sample_counter,
+                )
+                _viz_sample_counter += int(action_label.shape[0])
+
     # Compute and log LangGeoNetV2 cost-predictor quality metrics
     if _all_lang_preds:
         cost_metrics = _compute_lange3d_cost_metrics(_all_lang_preds, _all_gt_costs)
@@ -729,7 +765,8 @@ def evaluate(
                 commit=False,
             )
 
-    # Log data to wandb/console, with visualizations selected from the last batch
+    # Log loss summaries to console/wandb (visualization is done per-batch
+    # inside the loop, so we disable it here with image_log_freq=0).
     _log_data(
         i=i,
         epoch=epoch,
@@ -750,6 +787,7 @@ def evaluate(
         mode=eval_type,
         use_latest=False,
         wandb_increment_step=False,
+        image_log_freq=0,  # skip viz — already done per-batch
         **kwargs,
     )
 
