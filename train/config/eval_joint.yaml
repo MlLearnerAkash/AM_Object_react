@@ -1,0 +1,66 @@
+# Minimal config for end-to-end joint evaluation (eval.py)
+# Usage:  python eval.py -c config/eval_joint.yaml
+
+project_name: e3d_object_react
+run_name: eval_joint
+
+# ---- Joint checkpoint (contains both GNM + LangGeoNetV2 weights) ----
+joint_checkpoint: /data/ws/VLN-CE/controller/object_react/train/logs/e3d_object_react/keep_600_epoch_joint_train_2026_04_30_01_43_45_/joint_latest.pth
+
+# ---- Key model settings ----
+model_type: gnm
+predict_dists: True
+goal_type: "image_mask_enc"
+obs_type: "disabled"
+dims: 8
+goal_uses_context: False
+
+# ---- LangGeoNetV2 model config ----
+lange3d_clip_model: "openai/clip-vit-base-patch16"
+lange3d_dino_model: "facebook/dinov2-small"
+lange3d_d_model: 256
+lange3d_n_heads: 8
+lange3d_n_layers: 2
+lange3d_freeze_clip: True
+lange3d_freeze_dino: True
+gnm_mask_h: 60
+gnm_mask_w: 80
+mask_h: 120
+mask_w: 160
+
+# ---- Action / trajectory ----
+len_traj_pred: 10
+learn_angle: True
+
+# ---- Distance bounds ----
+distance:
+  min_dist_cat: 0
+  max_dist_cat: 20
+action:
+  min_dist_cat: 2
+  max_dist_cat: 20
+
+# ---- Eval settings ----
+use_wandb: False
+eval_batch_size: 16
+eval_num_workers: 0
+gpu_ids: [0]
+seed: 42
+eval_fraction: 1.0
+
+# ---- Dataset ----
+datasets:
+  object_react:
+    data_folder: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/vint_format_rxr_ep454
+    train: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/vint_format_ep454/vint_format/train
+    test: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/vint_format_ep454/vint_format/train
+    end_slack: 3
+    goals_per_obs: 1
+    negative_mining: True
+    waypoint_spacing: 1
+
+# ---- Misc ----
+hm3d_to_habitat: True
+eval_negatives: False
+max_traj_len: 100
+filter_dead_samples: True

@@ -1,0 +1,105 @@
+project_name: e3d_object_react
+run_name: eval_only
+
+# KEY PARAMS
+predict_dists: True
+goal_type: "image_mask_enc"
+obs_type: "disabled"
+dims: 8
+goal_uses_context: False
+
+# LangGeoNetV2 config (used when --cost_source predicted)
+lange3d_clip_model: "openai/clip-vit-base-patch16"
+lange3d_dino_model: "facebook/dinov2-small"
+lange3d_d_model: 256
+lange3d_n_heads: 8
+lange3d_n_layers: 2
+lange3d_freeze_clip: True
+lange3d_freeze_dino: True
+gnm_mask_h: 60
+gnm_mask_w: 80
+mask_h: 120
+mask_w: 160
+
+# Weights ##################################################################
+# REQUIRED: the trained Object-React GNM checkpoint (used in BOTH modes).
+gnm_pretrained_checkpoint: /home/opervu-user/.cache/huggingface/hub/models--oravus--ObjectReact/snapshots/69cba7a90197edef8cbe051fe2524015d8f4f4d5/latest.pth
+
+# REQUIRED only when --cost_source predicted:
+lange3d_checkpoint: /data/ws/VLN-CE/controller/object_react/train/checkpoints/joint/best_joint_190426_episodic_inst.pth
+joint_checkpoint: /data/ws/VLN-CE/controller/object_react/train/logs/e3d_object_react/keep_600_epoch_joint_train_2026_04_30_01_43_45_/joint_latest.pth
+
+
+# training setup (eval only uses eval_batch_size / eval_num_workers)
+use_wandb: False
+eval_batch_size: 16
+eval_num_workers: 0
+gpu_ids: [0]
+seed: 42
+
+# model params
+model_type: gnm
+obs_encoding_size: 1024
+goal_encoding_size: 1024
+
+# normalization
+normalize: True
+
+# context
+context_type: temporal
+context_size: 5
+
+# tradeoff between action and distance prediction loss
+alpha: 0.5
+
+distance:
+  min_dist_cat: 0
+  max_dist_cat: 20
+action:
+  min_dist_cat: 2
+  max_dist_cat: 20
+close_far_threshold: 10
+
+# action output params
+len_traj_pred: 10
+learn_angle: True
+
+# dataset
+image_size: [85, 64]
+
+# TopoPaths / LangGeoNetV2 kwargs
+pl_perturb_ratio: 0.0
+pl_perturb_type: max_val
+mask_crop_ratio: 1.0
+use_mask_grad: False
+
+precomputed_filename: null
+
+# HM3D → Habitat coordinate fix: negate Y-axis of GT waypoints
+# ([right, forward] → [right, backward]).
+hm3d_to_habitat: True
+
+# Disable negative sampling during eval (every goal is from the same trajectory).
+eval_negatives: False
+
+datasets:
+  object_react:
+    data_folder: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/vint_format_rxr_ep454
+    train: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/vint_format_ep454/vint_format/train
+    test: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/vint_format_ep454/vint_format/train #test
+    end_slack: 3
+    goals_per_obs: 1
+    negative_mining: True
+    waypoint_spacing: 1
+    images_nameformat: "{idx}.jpg"
+
+# logging
+print_log_freq: 5
+image_log_freq: 10
+num_images_log: 40
+eval_fraction: 1.0
+viz_images_per_batch: 4
+
+# filtering
+max_traj_len: 100
+filter_dead_samples: True
