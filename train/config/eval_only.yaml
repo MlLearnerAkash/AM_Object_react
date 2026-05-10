@@ -23,12 +23,11 @@ mask_w: 160
 
 # Weights ##################################################################
 # REQUIRED: the trained Object-React GNM checkpoint (used in BOTH modes).
-gnm_pretrained_checkpoint: /home/opervu-user/.cache/huggingface/hub/models--oravus--ObjectReact/snapshots/69cba7a90197edef8cbe051fe2524015d8f4f4d5/latest.pth
+gnm_pretrained_checkpoint: /data/ws/VLN-CE/controller/object_react/train/logs/e3d_object_react/joint_train_2026_05_09_08_53_39_/latest.pth
+#/home/opervu-user/.cache/huggingface/hub/models--oravus--ObjectReact/snapshots/69cba7a90197edef8cbe051fe2524015d8f4f4d5/latest.pth
 
 # REQUIRED only when --cost_source predicted:
 lange3d_checkpoint: /data/ws/VLN-CE/controller/object_react/train/checkpoints/joint/best_joint_190426_episodic_inst.pth
-joint_checkpoint: /data/ws/VLN-CE/controller/object_react/train/logs/e3d_object_react/keep_600_epoch_joint_train_2026_04_30_01_43_45_/joint_latest.pth
-
 
 # training setup (eval only uses eval_batch_size / eval_num_workers)
 use_wandb: False
@@ -86,7 +85,7 @@ datasets:
   object_react:
     data_folder: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/vint_format_rxr_ep454
     train: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/vint_format_ep454/vint_format/train
-    test: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/vint_format_ep454/vint_format/train #test
+    test: /media/opervu-user/Data2/ws/data_langgeonet_e3d_action/vint_format_ep454/vint_format/test
     end_slack: 3
     goals_per_obs: 1
     negative_mining: True
