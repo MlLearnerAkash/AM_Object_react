@@ -104,7 +104,7 @@ def train_eval_loop(
             print(f"Start {dataset_type} ViNT Testing Epoch {epoch}/{epochs}")
             loader = test_dataloaders[dataset_type]
 
-            test_dist_loss, test_action_loss, total_eval_loss = evaluate(
+            test_dist_loss, test_action_loss, total_eval_loss, traj_metrics = evaluate(
                 eval_type=dataset_type,
                 model=model,
                 dataloader=loader,
@@ -147,6 +147,7 @@ def train_eval_loop(
                 {
                     "avg_total_test_loss": np.mean(avg_total_test_loss),
                     "lr": optimizer.param_groups[0]["lr"],
+                    "epoch": epoch,
                 },
                 commit=False,
             )

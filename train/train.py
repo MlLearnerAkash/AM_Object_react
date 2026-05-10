@@ -432,6 +432,38 @@ def main(config):
             print(f"  [GNM pretrain] unexpected keys ({len(unexpected)}): {unexpected[:5]}...")
         print(f"  [GNM pretrain] loaded {len(state) - len(unexpected)}/{len(state)} keys")
 
+        # ---- Selective layer unfreezing for GNM fine-tuning ----
+        unfreeze_n = int(config.get("gnm_unfreeze_last_n_layers", 0))
+        if unfreeze_n > 0:
+            # Ordered list of GNM submodule names (first = closest to input)
+            gnm_layer_names = [
+                "goal_mobilenet",
+                "linear_layers",
+                "dist_predictor",
+                "action_predictor",
+            ]
+            # Freeze all parameters first
+            for p in model.parameters():
+                p.requires_grad = False
+            # Unfreeze only the last N layers
+            unfreeze_names = gnm_layer_names[-unfreeze_n:]
+            for name in unfreeze_names:
+                mod = getattr(model, name, None)
+                if mod is not None:
+                    for p in mod.parameters():
+                        p.requires_grad = True
+            frozen_names = [n for n in gnm_layer_names if n not in unfreeze_names]
+            print(
+                f"  [GNM freeze] frozen: {frozen_names}  |  "
+                f"unfrozen (last {unfreeze_n}): {unfreeze_names}"
+            )
+            # Summary
+            total_params = sum(1 for _ in model.parameters())
+            trainable_params = sum(1 for p in model.parameters() if p.requires_grad)
+            print(
+                f"  [GNM freeze] trainable params: {trainable_params}/{total_params}"
+            )
+
     print("Readying trainer...")
     optimizer, scheduler = ready_trainer(config, model)
     current_epoch = 0

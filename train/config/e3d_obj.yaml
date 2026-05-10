@@ -30,9 +30,9 @@ lange3d_lambda_rank: 0.5
 
 # training setup
 use_wandb: True
-batch_size: 32
+batch_size: 128
 eval_batch_size: 16
-epochs: 10
+epochs: 300
 gpu_ids: [0]
 num_workers: 0
 eval_num_workers: 0
@@ -59,6 +59,10 @@ alpha: 0.5
 lambda_lange3d: 1.0
 clip_grad_norm: 1.0
 
+# trajectory evaluation metrics
+success_threshold: 1.0   # meters — final waypoint within this distance = success
+dtw_threshold: 1.0       # meters — nDTW normalisation constant
+
 distance:
   min_dist_cat: 0
   max_dist_cat: 20
@@ -84,7 +88,12 @@ precomputed_filename: null
 
 #Pretrained models: optional
 gnm_pretrained_checkpoint: /home/opervu-user/.cache/huggingface/hub/models--oravus--ObjectReact/snapshots/69cba7a90197edef8cbe051fe2524015d8f4f4d5/latest.pth
-lange3d_checkpoint: /data/ws/VLN-CE/controller/object_react/train/checkpoints/joint/best_joint.pth
+lange3d_checkpoint: /data/ws/VLN-CE/controller/object_react/train/checkpoints/joint/best_joint_190426_episodic_inst.pth #or None
+
+# GNM fine-tuning: unfreeze only the last N layers (freeze the rest).
+# Layers order: goal_mobilenet, linear_layers, dist_predictor, action_predictor.
+# Set to 0 (or omit) to train all layers. Set to 3 for "last 3" (heads + fusion).
+gnm_unfreeze_last_n_layers: 3
 
 datasets:
   object_react:

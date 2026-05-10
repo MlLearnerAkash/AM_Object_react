@@ -257,6 +257,121 @@ def _compute_lange3d_cost_metrics(
     }
 
 
+def _compute_trajectory_metrics(
+    all_action_preds: list,
+    all_action_labels: list,
+    success_threshold: float = 3.0,
+    dtw_threshold: float = 3.0,
+) -> dict:
+    """
+    Compute per-sample trajectory-level metrics accumulated across the
+    evaluation dataset.
+
+    Args:
+        all_action_preds:  list of Tensors, each [N, A] where N=len_traj_pred,
+                            A>=2 (first 2 dims are xy waypoints).
+        all_action_labels: list of Tensors, same shape convention.
+        success_threshold: distance (meters) under which the final waypoint is
+                           considered a success.
+        dtw_threshold:     normalisation constant for nDTW.
+
+    Returns:
+        dict with keys:
+            traj_cos_sim   – mean cosine similarity (trajectory-level)
+            nDTW           – mean normalised Dynamic Time Warping
+            success_rate   – fraction of trajectories within threshold
+    """
+    if not all_action_preds or not all_action_labels:
+        return {"traj_cos_sim": float("nan"),
+                "nDTW": float("nan"),
+                "success_rate": float("nan")}
+
+    cos_sims = []
+    ndtws = []
+    successes = []
+
+    for pred, label in zip(all_action_preds, all_action_labels):
+        if pred is None or label is None:
+            continue
+
+        # Work with numpy on CPU
+        pred_np = pred.detach().cpu().float().numpy()   # [N, A]
+        label_np = label.detach().cpu().float().numpy()  # [N, A]
+
+        N = min(pred_np.shape[0], label_np.shape[0])
+        if N < 1:
+            continue
+
+        # Positions only (first 2 dims)
+        p = pred_np[:N, :2]
+        g = label_np[:N, :2]
+
+        # --- Cosine similarity (trajectory-level: flattened waypoint vector) ---
+        p_flat = p.reshape(-1)
+        g_flat = g.reshape(-1)
+        norm_p = np.linalg.norm(p_flat)
+        norm_g = np.linalg.norm(g_flat)
+        if norm_p > 1e-8 and norm_g > 1e-8:
+            cos_sims.append(float(np.dot(p_flat, g_flat) / (norm_p * norm_g)))
+
+        # --- nDTW (normalised Dynamic Time Warping) ---
+        ndtw_val = _compute_ndtw(p, g, dtw_threshold)
+        if not np.isnan(ndtw_val):
+            ndtws.append(ndtw_val)
+
+        # --- Success rate (final waypoint within threshold) ---
+        final_dist = float(np.linalg.norm(p[-1] - g[-1]))
+        successes.append(1.0 if final_dist < success_threshold else 0.0)
+
+    return {
+        "traj_cos_sim":   float(np.mean(cos_sims)) if cos_sims else float("nan"),
+        "nDTW":           float(np.mean(ndtws)) if ndtws else float("nan"),
+        "success_rate":   float(np.mean(successes)) if successes else float("nan"),
+    }
+
+
+def _compute_ndtw(pred_path: "np.ndarray", gt_path: "np.ndarray",
+                  d_threshold: float = 3.0) -> float:
+    """
+    Compute normalised Dynamic Time Warping between two paths.
+
+    nDTW = exp( - DTW(pred, gt) / (d_threshold * len(gt)) )
+
+    Args:
+        pred_path:  [N, 2] predicted waypoints.
+        gt_path:    [M, 2] ground-truth waypoints.
+        d_threshold: success distance threshold (meters).
+
+    Returns:
+        nDTW value in (0, 1] (higher is better), or NaN if degenerate.
+    """
+    N, M = pred_path.shape[0], gt_path.shape[0]
+    if N < 1 or M < 1:
+        return float("nan")
+
+    # Pairwise distance matrix [N, M]
+    D = np.linalg.norm(
+        pred_path[:, None, :] - gt_path[None, :, :], axis=-1
+    )  # [N, M]
+
+    # DP table
+    dtw = np.full((N + 1, M + 1), np.inf)
+    dtw[0, 0] = 0.0
+
+    for i in range(1, N + 1):
+        for j in range(1, M + 1):
+            cost = D[i - 1, j - 1]
+            dtw[i, j] = cost + min(dtw[i - 1, j],      # insertion
+                                   dtw[i, j - 1],      # deletion
+                                   dtw[i - 1, j - 1])  # match
+
+    dtw_dist = dtw[N, M]
+    denom = d_threshold * M
+    if denom < 1e-8:
+        return float("nan")
+    return float(np.exp(-dtw_dist / denom))
+
+
 def _log_data(
     i,
     epoch,
@@ -628,6 +743,8 @@ def evaluate(
     viz_obs_image = None
     _all_lang_preds: list = []
     _all_gt_costs:   list = []
+    _all_action_preds:  list = []  # per-sample trajectory predictions
+    _all_action_labels: list = []  # per-sample trajectory ground truths
     with torch.no_grad():
         tqdm_iter = tqdm.tqdm(
             itertools.islice(dataloader, num_batches),
@@ -677,6 +794,11 @@ def evaluate(
             action_mask = action_mask.to(device)
 
             dist_pred, action_pred = model_outputs
+
+            # Accumulate per-sample trajectories for end-of-epoch metrics
+            for b in range(action_pred.shape[0]):
+                _all_action_preds.append(action_pred[b].cpu())
+                _all_action_labels.append(action_label[b].cpu())
 
             losses = _compute_losses(
                 dist_label=dist_label,
@@ -729,6 +851,30 @@ def evaluate(
                 commit=False,
             )
 
+    # Compute and log trajectory-level metrics (cosine similarity, nDTW, success rate)
+    traj_metrics = _compute_trajectory_metrics(
+        _all_action_preds, _all_action_labels,
+        success_threshold=float(kwargs.get("success_threshold", 3.0)),
+        dtw_threshold=float(kwargs.get("dtw_threshold", 3.0)),
+    )
+    if _all_action_preds:
+        print(
+            f"(epoch {epoch}) [{eval_type}] "
+            f"traj_cos_sim={traj_metrics['traj_cos_sim']:.4f}  "
+            f"nDTW={traj_metrics['nDTW']:.4f}  "
+            f"success_rate={traj_metrics['success_rate']:.4f}"
+        )
+        if use_wandb:
+            wandb.log(
+                {
+                    f"{eval_type}/traj_cos_sim":   traj_metrics["traj_cos_sim"],
+                    f"{eval_type}/nDTW":           traj_metrics["nDTW"],
+                    f"{eval_type}/success_rate":   traj_metrics["success_rate"],
+                    "epoch":                       epoch,
+                },
+                commit=False,
+            )
+
     # Log data to wandb/console, with visualizations selected from the last batch
     _log_data(
         i=i,
@@ -757,6 +903,7 @@ def evaluate(
         dist_loss_logger.average(),
         action_loss_logger.average(),
         total_loss_logger.average(),
+        traj_metrics,
     )
 
 
